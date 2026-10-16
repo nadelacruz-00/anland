@@ -45,13 +45,14 @@ jobs:
       - name: Set NDK_DIR environment variable
         run: echo "NDK_DIR=$ANDROID_HOME/ndk/29.0.13113456" >> $GITHUB_ENV
 
-      - name: Generate debug keystore
+      # Use the fork's committed keystore instead of generating a fresh random
+      # one. A stable signing key means every build from this fork shares one
+      # signature, so the APK can be installed as an in-place UPDATE over the
+      # previous build (pm install -r) without wiping app data.
+      - name: Use the fork's fixed signing keystore
         run: |
           mkdir -p $HOME/.android
-          keytool -genkeypair -v -keystore $HOME/.android/debug.keystore \
-            -storepass android -alias androiddebugkey -keypass android \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug, O=Android, C=US" -noprompt
+          cp signing/anland-custom.keystore $HOME/.android/anland-custom.keystore
 
       - name: Test input handling
         if: matrix.name == 'anland-v5'
@@ -68,10 +69,10 @@ jobs:
           # appending to the tracked gradle.properties, which would dirty the working
           # tree and make the git-derived versionName ("...-dirty") wrong on CI.
           ./gradlew ${{ matrix.task }} \
-            -Pandroid.injected.signing.store.file="$HOME/.android/debug.keystore" \
-            -Pandroid.injected.signing.store.password=android \
-            -Pandroid.injected.signing.key.alias=androiddebugkey \
-            -Pandroid.injected.signing.key.password=android
+            -Pandroid.injected.signing.store.file="$HOME/.android/anland-custom.keystore" \
+            -Pandroid.injected.signing.store.password=anlandcustom \
+            -Pandroid.injected.signing.key.alias=anlandcustom \
+            -Pandroid.injected.signing.key.password=anlandcustom
           cp app/build/outputs/apk/${{ matrix.apk }} \
              app/build/outputs/apk/${{ matrix.name }}.apk
 

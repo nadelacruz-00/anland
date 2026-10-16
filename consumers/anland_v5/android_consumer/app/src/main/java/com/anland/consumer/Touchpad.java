@@ -300,7 +300,13 @@ public final class Touchpad {
         }
         float curX = toOutputX(event.getX(slowestIndex));
         float mid = outputWidth > 0 ? outputWidth / 2f : curX;
-        return curX < mid ? 0x110 : 0x111; // BTN_LEFT / BTN_RIGHT
+        // PATCHED (personal fork): a physical press is always a left click, like a
+        // Mac trackpad. Upstream resolved left vs right from the pressing finger's
+        // position ("click zones"), so pressing the right half of the pad produced
+        // BTN_RIGHT. Right click remains available from the two-finger tap, which
+        // this class implements separately in the two-finger tap path.
+        // Revert to `return curX < mid ? 0x110 : 0x111;` for upstream behaviour.
+        return 0x110; // BTN_LEFT
     }
 
     /** Map a pad (input-space) coordinate to the output space recognize() uses. */
