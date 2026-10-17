@@ -1299,13 +1299,124 @@ diff --git a/src/backends/native/meta-input-device-tool-native.h b/src/backends/
 diff --git a/clutter/clutter/clutter-stage.c b/clutter/clutter/clutter-stage.c
 --- a/clutter/clutter/clutter-stage.c
 +++ b/clutter/clutter/clutter-stage.c
-@@ -2975,7 +2975,8 @@
+@@ -3543,12 +3543,23 @@
+ 
+       sprite = clutter_backend_get_sprite (clutter_backend, stage, event);
+ 
++      /* TEMP DIAGNOSTIC (stylus Stage 3a). Remove before landing. */
++      if (device_type == CLUTTER_TABLET_DEVICE)
++        g_warning ("STYLUS_DIAG upd dev=%d role=%d pt=%.1f,%.1f",
++                   device_type, clutter_sprite_get_role (sprite),
++                   point.x, point.y);
++
+       clutter_stage_pick_and_update_sprite (stage,
+                                             sprite,
+                                             source_device,
+                                             CLUTTER_DEVICE_UPDATE_NONE,
+                                             point,
+                                             time_ms);
++
++      /* TEMP DIAGNOSTIC (stylus Stage 3a). Remove before landing. */
++      if (device_type == CLUTTER_TABLET_DEVICE)
++        g_warning ("STYLUS_DIAG upd focus=%p",
++                   (void *) clutter_focus_get_current_actor (CLUTTER_FOCUS (sprite)));
+ 
+       clutter_focus_update_from_event (CLUTTER_FOCUS (sprite), event);
+     }
+diff --git a/src/wayland/meta-wayland-tablet-seat.c b/src/wayland/meta-wayland-tablet-seat.c
+--- a/src/wayland/meta-wayland-tablet-seat.c
++++ b/src/wayland/meta-wayland-tablet-seat.c
+@@ -391,7 +391,13 @@
+     case CLUTTER_MOTION:
+       device_tool = clutter_event_get_device_tool (event);
+ 
++      /* TEMP DIAGNOSTIC (stylus Stage 3a). Remove before landing. */
++      g_warning ("STYLUS_DIAG wl seat_update type=%d device=%p tool=%p",
++                 clutter_event_type (event), (void *) device,
++                 (void *) device_tool);
++
+       if (device && device_tool)
++        tool = meta_wayland_tablet_seat_ensure_tool (tablet_seat, device_tool);      if (device && device_tool)
+         tool = meta_wayland_tablet_seat_ensure_tool (tablet_seat, device_tool);
+ 
+       if (!tool)
+@@ -640,7 +646,14 @@
      {
-       if ((flags & CLUTTER_DEVICE_UPDATE_IGNORE_CACHE) == 0)
-         {
--          if (clutter_sprite_point_in_clear_area (sprite, point))
-+          if (clutter_sprite_point_in_clear_area (sprite, point) &&
-+              clutter_focus_get_current_actor (CLUTTER_FOCUS (sprite)) != NULL)
-             {
-               clutter_sprite_update_coords (sprite, point);
-               return;
+       MetaWaylandTabletTool *tool = l->data;
+ 
++      /* TEMP DIAGNOSTIC (stylus Stage 3a). Remove before landing. */
++      g_warning ("STYLUS_DIAG tseat focus tablet=%p tool=%p match=%d surf=%p",
++                 (void *) tablet, (void *) tool,
++                 meta_wayland_tablet_tool_has_current_tablet (tool, tablet),
++                 (void *) surface);
++
+       if (meta_wayland_tablet_tool_has_current_tablet (tool, tablet))
++        meta_wayland_tablet_tool_focus_surface (tool, surface);      if (meta_wayland_tablet_tool_has_current_tablet (tool, tablet))
+         meta_wayland_tablet_tool_focus_surface (tool, surface);
+     }
+ }
+diff --git a/src/wayland/meta-wayland-seat.c b/src/wayland/meta-wayland-seat.c
+--- a/src/wayland/meta-wayland-seat.c
++++ b/src/wayland/meta-wayland-seat.c
+@@ -251,6 +251,14 @@
+         ClutterInputDevice *device;
+ 
+         device = clutter_sprite_get_sprite_device (CLUTTER_SPRITE (focus));
++
++        /* TEMP DIAGNOSTIC (stylus Stage 3a). Remove before landing. */
++        g_warning ("STYLUS_DIAG seat focus tablet dev=%p surface=%p",
++                   (void *) device, (void *) surface);
++
++        meta_wayland_tablet_seat_focus_surface (seat->tablet_seat,
++                                                device,
++                                                surface);        device = clutter_sprite_get_sprite_device (CLUTTER_SPRITE (focus));
+         meta_wayland_tablet_seat_focus_surface (seat->tablet_seat,
+                                                 device,
+                                                 surface);
+diff --git a/src/wayland/meta-wayland-tablet-tool.c b/src/wayland/meta-wayland-tablet-tool.c
+--- a/src/wayland/meta-wayland-tablet-tool.c
++++ b/src/wayland/meta-wayland-tablet-tool.c
+@@ -658,7 +658,12 @@
+   else
+     surface = NULL;
+ 
++  /* TEMP DIAGNOSTIC (stylus Stage 3a). Remove before landing. */
++  g_warning ("STYLUS_DIAG wl repick sprite=%p actor=%p surface=%p",
++             (void *) sprite, (void *) actor, (void *) surface);
++
+   meta_wayland_tablet_tool_set_current_surface (tool, surface);
++  clutter_sprite_invalidate_cursor (sprite);  meta_wayland_tablet_tool_set_current_surface (tool, surface);
+   clutter_sprite_invalidate_cursor (sprite);
+ }
+ 
+@@ -928,7 +933,13 @@
+ meta_wayland_tablet_tool_handle_event (MetaWaylandTabletTool *tool,
+                                        const ClutterEvent    *event)
+ {
++  /* TEMP DIAGNOSTIC (stylus Stage 3a). Remove before landing. */
++  g_warning ("STYLUS_DIAG wl handle type=%d focus=%p pressed=%d",
++             clutter_event_type (event), (void *) tool->focus_surface,
++             tool->pressed_buttons);
++
+   if (!tool->focus_surface)
++    return CLUTTER_EVENT_PROPAGATE;  if (!tool->focus_surface)
+     return CLUTTER_EVENT_PROPAGATE;
+ 
+   switch (clutter_event_type (event))
+diff --git a/src/backends/native/meta-input-device-native.c b/src/backends/native/meta-input-device-native.c
+--- a/src/backends/native/meta-input-device-native.c
++++ b/src/backends/native/meta-input-device-native.c
+@@ -545,6 +545,13 @@
+     return;
+ 
+   meta_viewport_info_get_extents (viewports, &stage_width, &stage_height);
++
++  /* No usable viewport geometry (e.g. a backend with a virtual monitor): there
++   * is nothing to translate, and a degenerate extent would clamp every tablet
++   * coordinate to 0. Leave the coordinates as the producer sent them. */
++  if (stage_width <= 0 || stage_height <= 0)
++    return;
++
+   x_d = *x / stage_width;
+   y_d = *y / stage_height;
+ 
