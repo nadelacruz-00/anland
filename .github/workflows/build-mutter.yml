@@ -21,6 +21,11 @@ on:
         required: true
         type: boolean
         default: false
+      keep_debug:
+        description: "Keep debug symbols in the binaries (for gdb backtraces; much larger .deb)"
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   build-debs:
@@ -46,6 +51,7 @@ jobs:
         env:
           MUTTER_VERSION: ${{ inputs.mutter_version }}
           BUILD_XWAYLAND: ${{ inputs.build_xwayland }}
+          KEEP_DEBUG: ${{ inputs.keep_debug }}
         run: |
           set -euxo pipefail
           docker run --rm \
@@ -53,6 +59,7 @@ jobs:
             -w /work \
             -e MUTTER_VERSION \
             -e BUILD_XWAYLAND \
+            -e KEEP_DEBUG \
             ubuntu:26.04 bash -lc '
               set -euo pipefail
               export DEBIAN_FRONTEND=noninteractive
@@ -60,6 +67,13 @@ jobs:
               apt-get install -y -qq --no-install-recommends \
                 ca-certificates curl patch sudo dpkg-dev devscripts \
                 build-essential fakeroot
+              # dh_strip splits symbols into a .ddeb and leaves only a
+              # .gnu_debuglink behind, which makes every gdb backtrace useless.
+              # nostrip keeps them in the binary so offsets can be resolved.
+              if [ "$KEEP_DEBUG" = "true" ]; then
+                export DEB_BUILD_OPTIONS="nostrip"
+                echo "KEEP_DEBUG: building with debug symbols retained"
+              fi
               cd /work/producers/gnome/Ubuntu2604_v5
               # WORKDIR must live on the mounted volume, otherwise the .debs are
               # written into the container and destroyed with it.
@@ -70,7 +84,10 @@ jobs:
         if: always()
         run: |
           mkdir -p debs
-          find ci-out -name '*.deb' -type f -exec cp -v {} debs/ \; || true
+          # dh_strip splits symbols into dbgsym .ddebs (build.sh resets
+          # DEB_BUILD_OPTIONS, so the keep_debug/nostrip export cannot reach
+          # dpkg-buildpackage). Collect them or backtraces stay unsymbolised.
+          find ci-out \( -name '*.deb' -o -name '*.ddeb' \) -type f -exec cp -v {} debs/ \; || true
           echo "--- collected ---"
           ls -l debs/ || true
 
@@ -86,6 +103,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: anland-mutter-debs
-          path: debs/*.deb
+          path: debs/*
           if-no-files-found: warn
           retention-days: 7
