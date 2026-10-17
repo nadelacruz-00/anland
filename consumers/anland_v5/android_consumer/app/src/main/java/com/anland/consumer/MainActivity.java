@@ -2200,8 +2200,89 @@ public class MainActivity extends Activity
     // ================================================================
     // Route touchscreen gestures and ordinary (non-captured) mouse events.
     // ================================================================
+    // ===================== stylus / tablet tool =====================
+    // Values mirror common/protocol.h.
+    private static final int TOOL_ACTION_ADDED   = 0;
+    private static final int TOOL_ACTION_REMOVED = 1;
+    private static final int TOOL_POS_PROXIMITY_IN  = 0;
+    private static final int TOOL_POS_MOTION        = 1;
+    private static final int TOOL_POS_PROXIMITY_OUT = 2;
+    private static final int TOOL_TYPE_PEN    = 0x140;
+    private static final int TOOL_TYPE_ERASER = 0x141;
+    private static final int TOOL_CAP_PRESSURE = 0x01;
+    private static final int TOOL_CAP_TILT     = 0x02;
+    private static final int TOOL_CAP_DISTANCE = 0x04;
+    /** One physical pen. tablet-v2 wants one stable tool object per physical tool. */
+    private static final int TOOL_ID = 1;
+
+    private boolean toolInProximity = false;
+    private int toolType = TOOL_TYPE_PEN;
+
+    private static boolean isStylusTool(MotionEvent e) {
+        int tool = e.getToolType(e.getActionIndex());
+        return tool == MotionEvent.TOOL_TYPE_STYLUS || tool == MotionEvent.TOOL_TYPE_ERASER;
+    }
+
+
+
+    /**
+     * Forward the pen as tablet-tool events. Deliberately does NOT consume the event:
+     * the normal touch path still runs afterwards, so apps that never bind
+     * zwp_tablet_v2 keep behaving exactly as before.
+     *
+     * The Stylo 2's side button is NOT handled here - it arrives as KEY_F21 on the
+     * Bluetooth HID node, not as a MotionEvent button, so buttons stay 0.
+     */
+    private void sendToolEvents(MotionEvent event) {
+        if (mNative == null) return;
+        int idx = event.getActionIndex();
+        int action = event.getActionMasked();
+        toolType = (event.getToolType(idx) == MotionEvent.TOOL_TYPE_ERASER)
+                ? TOOL_TYPE_ERASER : TOOL_TYPE_PEN;
+
+        boolean hovering = action == MotionEvent.ACTION_HOVER_ENTER
+                || action == MotionEvent.ACTION_HOVER_MOVE
+                || action == MotionEvent.ACTION_HOVER_EXIT;
+        boolean leaving = action == MotionEvent.ACTION_HOVER_EXIT
+                || action == MotionEvent.ACTION_CANCEL;
+
+        float[] coords = convertToNativeCoords(event.getX(idx), event.getY(idx));
+
+        if (!toolInProximity
+                && (action == MotionEvent.ACTION_HOVER_ENTER || action == MotionEvent.ACTION_DOWN)) {
+            toolInProximity = true;
+            mNative.sendTool(TOOL_ACTION_ADDED, TOOL_ID, toolType,
+                    TOOL_CAP_PRESSURE | TOOL_CAP_TILT | TOOL_CAP_DISTANCE);
+            mNative.sendToolPosition(TOOL_POS_PROXIMITY_IN, TOOL_ID, coords[0], coords[1]);
+        } else if (!leaving) {
+            mNative.sendToolPosition(TOOL_POS_MOTION, TOOL_ID, coords[0], coords[1]);
+        }
+
+        float[] tilt = new float[2];
+        ToolAxes.tiltXY(event.getAxisValue(MotionEvent.AXIS_TILT, idx),
+                        event.getAxisValue(MotionEvent.AXIS_ORIENTATION, idx), tilt);
+        mNative.sendToolAxes(TOOL_ID, ToolAxes.normPressure(event.getPressure(idx)),
+                             tilt[0], tilt[1]);
+
+        // Tip contact only; tip is BTN_TOUCH semantics, not a button.
+        boolean tip = !hovering && (action == MotionEvent.ACTION_DOWN
+                || action == MotionEvent.ACTION_MOVE);
+        mNative.sendToolButton(TOOL_ID, 0, false, tip);
+
+        mNative.sendToolFrame(TOOL_ID, (int) event.getEventTime());
+
+        if (toolInProximity && leaving) {
+            toolInProximity = false;
+            mNative.sendToolPosition(TOOL_POS_PROXIMITY_OUT, TOOL_ID, coords[0], coords[1]);
+            mNative.sendToolFrame(TOOL_ID, (int) event.getEventTime());
+            mNative.sendTool(TOOL_ACTION_REMOVED, TOOL_ID, toolType, 0);
+        }
+    }
+
     @Override
     public boolean onTouchEvent(MotionEvent event) {
+        if (isStylusTool(event))
+            sendToolEvents(event);
         if (touchscreenGrabbed && event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN))
             return true; // Android may still dispatch the tail queued before EVIOCGRAB.
         boolean mouseEvent = isMouseEvent(event);
@@ -2235,6 +2316,8 @@ public class MainActivity extends Activity
 
     @Override
     public boolean onGenericMotionEvent(MotionEvent event) {
+        if (isStylusTool(event))
+            sendToolEvents(event);
         if (isMouseEvent(event)) {
             int action = event.getActionMasked();
             if (action == MotionEvent.ACTION_BUTTON_PRESS
