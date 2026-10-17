@@ -1296,3 +1296,16 @@ diff --git a/src/backends/native/meta-input-device-tool-native.h b/src/backends/
 +                                                                     ClutterInputAxisFlags       axes);
 +
  G_END_DECLS
+diff --git a/clutter/clutter/clutter-stage.c b/clutter/clutter/clutter-stage.c
+--- a/clutter/clutter/clutter-stage.c
++++ b/clutter/clutter/clutter-stage.c
+@@ -2975,7 +2975,8 @@
+     {
+       if ((flags & CLUTTER_DEVICE_UPDATE_IGNORE_CACHE) == 0)
+         {
+-          if (clutter_sprite_point_in_clear_area (sprite, point))
++          if (clutter_sprite_point_in_clear_area (sprite, point) &&
++              clutter_focus_get_current_actor (CLUTTER_FOCUS (sprite)) != NULL)
+             {
+               clutter_sprite_update_coords (sprite, point);
+               return;
