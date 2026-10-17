@@ -69,6 +69,55 @@ struct buf_info {
 #define INPUT_TYPE_RESOURCE       11
 #define INPUT_TYPE_RESOURCE_INVALID 12
 
+/* ---------------------------------------------------------------------------
+ * Stylus / tablet tool. Consumer -> producer, over the same data channel.
+ *
+ * Every tool struct below is deliberately kept within the existing 16-byte
+ * union (sizeof(touch) == sizeof(pointer_motion) == 16), so sizeof(struct
+ * InputEvent) does not change. That gives compatibility for free in both
+ * directions: an older producer paired with a newer consumer skips unknown
+ * tool events instead of misaligning the stream, and a newer producer paired
+ * with an older consumer simply never sees them and keeps using the touch
+ * path. No explicit version handshake is required for that reason.
+ *
+ * Coordinates and axis values use float, matching the existing touch and
+ * pointer events. Both sides are the same architecture in practice.
+ *
+ * MEASURED ON HARDWARE (OnePlus Pad 3 + Stylo 2), do not "simplify" these away:
+ *  - Android's getPressure() is NOT normalised on this device and reached
+ *    ~9.77 instead of 0..1. The consumer MUST normalise before sending, and
+ *    the producer MUST clamp defensively.
+ *  - AXIS_ORIENTATION reached ~4.37 rad, past +/-pi. The consumer MUST wrap it.
+ *  - AXIS_TILT is unsigned 0..pi/2; tilt direction comes from orientation, so
+ *    tilt_x/tilt_y are derived from the pair rather than read directly.
+ *  - The barrel button was NOT observed on the event path at all (the Stylo 2
+ *    pairs over Bluetooth HID), so tool_button is emitted even when unused.
+ * ------------------------------------------------------------------------- */
+#define INPUT_TYPE_TOOL           13 /* tool added / removed, with capabilities */
+#define INPUT_TYPE_TOOL_POSITION  14 /* proximity in/out and motion             */
+#define INPUT_TYPE_TOOL_AXES      15 /* pressure and tilt                        */
+#define INPUT_TYPE_TOOL_BUTTON    16 /* tip contact and barrel buttons           */
+#define INPUT_TYPE_TOOL_FRAME     17 /* end of one hardware sample group         */
+
+/* INPUT_TYPE_TOOL */
+#define TOOL_ACTION_ADDED         0
+#define TOOL_ACTION_REMOVED       1
+
+/* INPUT_TYPE_TOOL_POSITION */
+#define TOOL_POSITION_PROXIMITY_IN  0
+#define TOOL_POSITION_MOTION        1
+#define TOOL_POSITION_PROXIMITY_OUT 2
+
+/* Tool types; same values as wayland tablet-v2 tool types. */
+#define TOOL_TYPE_PEN             0x140
+#define TOOL_TYPE_ERASER          0x141
+
+/* Capability bits reported in InputEvent.tool.caps. */
+#define TOOL_CAP_PRESSURE         0x01
+#define TOOL_CAP_TILT             0x02
+#define TOOL_CAP_DISTANCE         0x04
+#define TOOL_CAP_ROTATION         0x08
+
 /* Service identifiers used by OUTPUT_TYPE_RESOURCES_REQUEST / INPUT_TYPE_RESOURCE. */
 #define SERVICE_TYPE_CAMERA 1
 
@@ -121,6 +170,36 @@ struct InputEvent {
             uint32_t type;
             uint32_t fdnum; // number of fds following in DATA_MSG_INPUT_EXTEND_FDS
         } resource;
+        /* --- stylus / tablet tool (16 bytes max, see the note above) --- */
+        struct {
+            uint32_t action;    /* TOOL_ACTION_*   */
+            uint32_t tool_id;   /* stable per physical tool */
+            uint32_t tool_type; /* TOOL_TYPE_*     */
+            uint32_t caps;      /* TOOL_CAP_* bitmask */
+        } tool;                 /* 16 */
+        struct {
+            uint32_t action;    /* TOOL_POSITION_* */
+            uint32_t tool_id;
+            float    x;         /* compositor logical coordinates */
+            float    y;
+        } tool_position;        /* 16 */
+        struct {
+            uint32_t tool_id;
+            float    pressure;  /* consumer-normalised 0..1; producer clamps */
+            float    tilt_x;    /* radians */
+            float    tilt_y;    /* radians */
+        } tool_axes;            /* 16 */
+        struct {
+            uint32_t tool_id;
+            uint32_t button;    /* BTN_STYLUS / BTN_STYLUS2; 0 when only tip */
+            int32_t  pressed;
+            int32_t  tip;       /* 1 = tip contact (BTN_TOUCH semantics) */
+        } tool_button;          /* 16 */
+        struct {
+            uint32_t tool_id;
+            uint32_t time_ms;   /* consumer event time; frame boundary */
+        } tool_frame;           /* 8 */
+
         struct {
             uint32_t padding[4];
         };
