@@ -498,8 +498,14 @@ handle_tool (MetaAnlandInput             *input,
                                   GUINT_TO_POINTER (event->tool.tool_id));
       if (tool && tool == input->current_tool)
         tool_proximity_out (input);
-      g_hash_table_remove (input->tools,
-                           GUINT_TO_POINTER (event->tool.tool_id));
+
+      /* The tool object is deliberately KEPT. tablet-v2 wants one stable tool
+       * per physical tool, and mutter's wayland layer keys its tools by this
+       * pointer and never forgets them: recreating the object each hover
+       * session leaves the compositor holding tools that never receive a focus
+       * surface, whose events are then dropped (measured: 15297 events matched
+       * a tool with no focus, 0 of them tip presses). Only the proximity state
+       * is session-scoped, not the tool. */
       break;
     default:
       break;
