@@ -91,6 +91,41 @@ enum {
     /* Consumer reports the requested service's fds were unusable. Same layout
      * as RESOURCE (type + fdnum) — matches protocol.h INPUT_TYPE_RESOURCE_INVALID. */
     ANLAND_DEVICE_IN_RESOURCE_INVALID = 12,
+    /* Stylus / tablet tool. Values MUST stay in sync with protocol.h
+     * INPUT_TYPE_TOOL* — the producer transport hands the wire type through
+     * verbatim, so the two enums are the same numbers by construction. */
+    ANLAND_DEVICE_IN_TOOL          = 13,
+    ANLAND_DEVICE_IN_TOOL_POSITION = 14,
+    ANLAND_DEVICE_IN_TOOL_AXES     = 15,
+    ANLAND_DEVICE_IN_TOOL_BUTTON   = 16,
+    ANLAND_DEVICE_IN_TOOL_FRAME    = 17,
+};
+
+/* Tool lifecycle actions (protocol.h TOOL_ACTION_*). */
+enum {
+    ANLAND_DEVICE_TOOL_ADDED   = 0,
+    ANLAND_DEVICE_TOOL_REMOVED = 1,
+};
+
+/* Tool positions (protocol.h TOOL_POSITION_*). */
+enum {
+    ANLAND_DEVICE_TOOL_PROXIMITY_IN  = 0,
+    ANLAND_DEVICE_TOOL_MOTION        = 1,
+    ANLAND_DEVICE_TOOL_PROXIMITY_OUT = 2,
+};
+
+/* Tool types; same values as wayland tablet-v2 tool types. */
+enum {
+    ANLAND_DEVICE_TOOL_TYPE_PEN    = 0x140,
+    ANLAND_DEVICE_TOOL_TYPE_ERASER = 0x141,
+};
+
+/* Capability bits reported in anland_device_input.tool.caps. */
+enum {
+    ANLAND_DEVICE_TOOL_CAP_PRESSURE = 0x01,
+    ANLAND_DEVICE_TOOL_CAP_TILT     = 0x02,
+    ANLAND_DEVICE_TOOL_CAP_DISTANCE = 0x04,
+    ANLAND_DEVICE_TOOL_CAP_ROTATION = 0x08,
 };
 
 /* Touch/button action codes carried by ANLAND_DEVICE_IN_TOUCH /
@@ -132,6 +167,13 @@ typedef struct anland_device_input {
         struct { uint32_t size; } text_input;  /* payload via anland_device_read_input */
         struct { uint32_t action; int32_t value; } input_action;
         struct { uint32_t type; uint32_t fdnum; } resource; /* fds via anland_device_read_fds */
+        /* Stylus / tablet tool. Every field stays inside the 16-byte union, so
+         * sizeof(anland_device_input_t) keeps matching struct InputEvent. */
+        struct { uint32_t action; uint32_t tool_id; uint32_t tool_type; uint32_t caps; } tool;
+        struct { uint32_t action; uint32_t tool_id; float x; float y; } tool_position;
+        struct { uint32_t tool_id; float pressure; float tilt_x; float tilt_y; } tool_axes;
+        struct { uint32_t tool_id; uint32_t button; int32_t pressed; int32_t tip; } tool_button;
+        struct { uint32_t tool_id; uint32_t time_ms; } tool_frame;
         struct { uint32_t padding[4]; };
     };
 } anland_device_input_t;

@@ -12,3 +12,12 @@ trap 'rm -rf -- "$test_build_dir"' EXIT HUP INT TERM
     "$test_dir/../../../../../common/socket_utils.c" \
     -o "$test_build_dir/input_grab_test"
 "$test_build_dir/input_grab_test"
+
+# The tablet-tool wire contract: struct sizes and the parity between the wire
+# enums and the producer's, which nothing else checks.
+"${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
+    -I"$test_dir/../../../../../common" \
+    -I"$test_dir/../../../../../../../libdisplay_producer" \
+    "$test_dir/protocol_test.c" \
+    -o "$test_build_dir/protocol_test"
+"$test_build_dir/protocol_test"
