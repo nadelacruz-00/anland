@@ -1352,6 +1352,89 @@ Java_com_anland_consumer_Native_nativeSendTouchFrame(
     push_input_event(s->ctx, &ev);
 }
 
+/* ---------------------------------------------------------------------------
+ * Stylus / tablet tool senders. See common/protocol.h for the event layout and
+ * for the device-measured notes on pressure normalisation, orientation
+ * wrapping and tilt derivation - the Java caller owns all of that and passes
+ * already-normalised values here.
+ * ------------------------------------------------------------------------- */
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeSendTool(
+    JNIEnv *env, jclass clazz, jlong handle, jint action, jint tool_id, jint tool_type, jint caps)
+{
+    struct consumer_state *s = STATE(handle);
+    if (!s || !s->ctx)
+        return;
+    struct InputEvent ev = {
+        .type = INPUT_TYPE_TOOL,
+        .tool = { .action    = (uint32_t) action,
+                  .tool_id   = (uint32_t) tool_id,
+                  .tool_type = (uint32_t) tool_type,
+                  .caps      = (uint32_t) caps },
+    };
+    push_input_event(s->ctx, &ev);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeSendToolPosition(
+    JNIEnv *env, jclass clazz, jlong handle, jint action, jint tool_id, jfloat x, jfloat y)
+{
+    struct consumer_state *s = STATE(handle);
+    if (!s || !s->ctx)
+        return;
+    struct InputEvent ev = {
+        .type = INPUT_TYPE_TOOL_POSITION,
+        .tool_position = { .action = (uint32_t) action, .tool_id = (uint32_t) tool_id,
+                           .x = x, .y = y },
+    };
+    push_input_event(s->ctx, &ev);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeSendToolAxes(
+    JNIEnv *env, jclass clazz, jlong handle, jint tool_id, jfloat pressure, jfloat tilt_x, jfloat tilt_y)
+{
+    struct consumer_state *s = STATE(handle);
+    if (!s || !s->ctx)
+        return;
+    struct InputEvent ev = {
+        .type = INPUT_TYPE_TOOL_AXES,
+        .tool_axes = { .tool_id = (uint32_t) tool_id, .pressure = pressure,
+                       .tilt_x = tilt_x, .tilt_y = tilt_y },
+    };
+    push_input_event(s->ctx, &ev);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeSendToolButton(
+    JNIEnv *env, jclass clazz, jlong handle, jint tool_id, jint button, jboolean pressed, jboolean tip)
+{
+    struct consumer_state *s = STATE(handle);
+    if (!s || !s->ctx)
+        return;
+    struct InputEvent ev = {
+        .type = INPUT_TYPE_TOOL_BUTTON,
+        .tool_button = { .tool_id = (uint32_t) tool_id, .button = (uint32_t) button,
+                         .pressed = pressed ? 1 : 0, .tip = tip ? 1 : 0 },
+    };
+    push_input_event(s->ctx, &ev);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeSendToolFrame(
+    JNIEnv *env, jclass clazz, jlong handle, jint tool_id, jint time_ms)
+{
+    struct consumer_state *s = STATE(handle);
+    if (!s || !s->ctx)
+        return;
+    struct InputEvent ev = {
+        .type = INPUT_TYPE_TOOL_FRAME,
+        .tool_frame = { .tool_id = (uint32_t) tool_id, .time_ms = (uint32_t) time_ms },
+    };
+    push_input_event(s->ctx, &ev);
+}
+
 JNIEXPORT void JNICALL
 Java_com_anland_consumer_Native_nativeSendKey(
     JNIEnv *env, jclass clazz, jlong handle, jint action, jint keycode)
