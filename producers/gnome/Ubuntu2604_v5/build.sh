@@ -204,8 +204,16 @@ main() {
 
     build_pkg mutter "$mutter_patch" "$MUTTER_VERSION" "$SCRIPT_DIR/mutter" \
         'have_anland = get_option'
-    build_pkg xwayland "$xwayland_patch" '' '' \
-        'No usable linux-dmabuf main device'
+    # BUILD_XWAYLAND=0 builds mutter only. Added for the fork's CI: mutter is the
+    # large part of the work and is what carries the Anland backend, so being able
+    # to prove the mutter build independently keeps a first CI run short and makes
+    # a failure unambiguous about which package broke.
+    if [ "${BUILD_XWAYLAND:-1}" = 1 ]; then
+        build_pkg xwayland "$xwayland_patch" '' '' \
+            'No usable linux-dmabuf main device'
+    else
+        log "BUILD_XWAYLAND=0: skipping xwayland"
+    fi
 
     if [ "${ANLAND_INSTALL:-0}" != 1 ]; then
         log "Done. Built packages only; global environment unchanged."

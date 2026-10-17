@@ -1,0 +1,91 @@
+name: Build patched Mutter + XWayland .debs
+
+# Proof-of-pipeline job for the fork. Runs upstream's producers/gnome/Ubuntu2604_v5/
+# build.sh inside a real Ubuntu 26.04 arm64 container on an arm64 runner, so the
+# resulting .deb is bit-comparable with what droidspaces-package publishes.
+#
+# Manual only, deliberately: a mutter build is long and nothing else should
+# trigger it. The Anland patch targets mutter 50.1, so pin the exact source
+# version - an unpinned build would silently move to a revision the patch no
+# longer applies to.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mutter_version:
+        description: "Exact Ubuntu source version to build (e.g. 50.1-0ubuntu2.4)"
+        required: false
+        default: "50.1-0ubuntu2.4"
+      build_xwayland:
+        description: "Also build XWayland (slower; mutter alone proves the pipeline)"
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  build-debs:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Show what we are building
+        run: |
+          echo "mutter version : ${{ inputs.mutter_version }}"
+          echo "build xwayland : ${{ inputs.build_xwayland }}"
+          echo "--- build.sh present ---"
+          ls -l producers/gnome/Ubuntu2604_v5/build.sh
+          echo "--- mutter overlay (symlink -> backend) ---"
+          ls producers/gnome/Ubuntu2604_v5/mutter/src/backends/anland/ | head
+          echo "--- patch targets mutter 50.1? ---"
+          grep -m1 -o 'clutter_stage_view_present@Base 50.1' producers/gnome/Ubuntu2604_v5/mutter.patch || true
+
+      - name: Build .debs inside an Ubuntu 26.04 arm64 container
+        env:
+          MUTTER_VERSION: ${{ inputs.mutter_version }}
+          BUILD_XWAYLAND: ${{ inputs.build_xwayland }}
+        run: |
+          set -euxo pipefail
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            -e MUTTER_VERSION \
+            -e BUILD_XWAYLAND \
+            ubuntu:26.04 bash -lc '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                ca-certificates curl patch sudo dpkg-dev devscripts \
+                build-essential fakeroot
+              cd /work/producers/gnome/Ubuntu2604_v5
+              # WORKDIR must live on the mounted volume, otherwise the .debs are
+              # written into the container and destroyed with it.
+              WORKDIR=/work/ci-out bash build.sh
+            '
+
+      - name: Collect built packages
+        if: always()
+        run: |
+          mkdir -p debs
+          find ci-out -name '*.deb' -type f -exec cp -v {} debs/ \; || true
+          echo "--- collected ---"
+          ls -l debs/ || true
+
+      - name: Show build log tail on failure
+        if: failure()
+        run: |
+          echo "Build failed. Check the step output above; the container log is"
+          echo "not captured to a file by this job yet - add tee if it becomes"
+          echo "tedious to read in the Actions UI."
+
+      - name: Upload .debs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: anland-mutter-debs
+          path: debs/*.deb
+          if-no-files-found: warn
+          retention-days: 7
