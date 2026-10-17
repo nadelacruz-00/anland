@@ -306,6 +306,10 @@ public final class Touchpad {
         // BTN_RIGHT. Right click remains available from the two-finger tap, which
         // this class implements separately in the two-finger tap path.
         // Revert to `return curX < mid ? 0x110 : 0x111;` for upstream behaviour.
+        // A press with two or more fingers resting on the pad is a right click -
+        // the physical equivalent of the two-finger tap.
+        if (event.getPointerCount() >= 2)
+            return 0x111; // BTN_RIGHT
         return 0x110; // BTN_LEFT
     }
 
