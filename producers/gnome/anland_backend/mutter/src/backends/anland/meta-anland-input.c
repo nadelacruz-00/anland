@@ -586,10 +586,14 @@ handle_tool_axes (MetaAnlandInput             *input,
    * push an out-of-range axis into the seat. */
   if (isfinite (event->tool_axes.pressure))
     input->sample_pressure = CLAMP (event->tool_axes.pressure, 0.0f, 1.0f);
+  /* The app sends radians; Clutter's tablet axes (libinput convention) and
+   * the tablet-v2 wire protocol are DEGREES (GDK maps the tilt event from
+   * a -90..90 valuator range). Sending radians made every client read
+   * tilt/180: GTK showed -0.009 for a -0.75 rad tilt. */
   if (isfinite (event->tool_axes.tilt_x))
-    input->sample_tilt_x = event->tool_axes.tilt_x;
+    input->sample_tilt_x = event->tool_axes.tilt_x * (180.0 / G_PI);
   if (isfinite (event->tool_axes.tilt_y))
-    input->sample_tilt_y = event->tool_axes.tilt_y;
+    input->sample_tilt_y = event->tool_axes.tilt_y * (180.0 / G_PI);
 
   input->sample_dirty = TRUE;
 }
