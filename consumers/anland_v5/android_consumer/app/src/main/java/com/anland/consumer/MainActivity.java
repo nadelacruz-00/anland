@@ -2200,8 +2200,46 @@ public class MainActivity extends Activity
     // ================================================================
     // Route touchscreen gestures and ordinary (non-captured) mouse events.
     // ================================================================
+    /**
+     * TEMPORARY DIAGNOSTIC (stylus work, Stage 0b).
+     *
+     * Logs the raw fields Android actually delivers for a stylus, so we can confirm
+     * tool type, pressure, tilt, distance and button state before writing any
+     * protocol support for them. Delete once the stylus work lands.
+     */
+    private void probeStylus(MotionEvent event, String from) {
+        int idx = event.getActionIndex();
+        int tool = event.getToolType(idx);
+        int action = event.getActionMasked();
+        boolean hover = action == MotionEvent.ACTION_HOVER_ENTER
+                || action == MotionEvent.ACTION_HOVER_MOVE
+                || action == MotionEvent.ACTION_HOVER_EXIT;
+        boolean stylusTool = tool == MotionEvent.TOOL_TYPE_STYLUS
+                || tool == MotionEvent.TOOL_TYPE_ERASER;
+        boolean stylusSource = (event.getSource() & InputDevice.SOURCE_STYLUS) == InputDevice.SOURCE_STYLUS
+                || (event.getSource() & InputDevice.SOURCE_BLUETOOTH_STYLUS) == InputDevice.SOURCE_BLUETOOTH_STYLUS;
+        // Log anything that is plausibly the pen: a stylus tool type, a stylus
+        // source, a hover action, or simply non-zero pressure.
+        if (!stylusTool && !stylusSource && !hover && event.getPressure(idx) <= 0f)
+            return;
+        Log.i(TAG, "STYLUS_PROBE from=" + from
+                + " action=" + MotionEvent.actionToString(action)
+                + " tool=" + tool
+                + " src=0x" + Integer.toHexString(event.getSource())
+                + " ptrs=" + event.getPointerCount()
+                + " idx=" + idx
+                + " pressure=" + event.getPressure(idx)
+                + " size=" + event.getSize(idx)
+                + " tilt=" + event.getAxisValue(MotionEvent.AXIS_TILT, idx)
+                + " orient=" + event.getAxisValue(MotionEvent.AXIS_ORIENTATION, idx)
+                + " dist=" + event.getAxisValue(MotionEvent.AXIS_DISTANCE, idx)
+                + " buttons=0x" + Integer.toHexString(event.getButtonState())
+                + " x=" + (int) event.getX(idx) + " y=" + (int) event.getY(idx));
+    }
+
     @Override
     public boolean onTouchEvent(MotionEvent event) {
+        probeStylus(event, "touch");
         if (touchscreenGrabbed && event.isFromSource(InputDevice.SOURCE_TOUCHSCREEN))
             return true; // Android may still dispatch the tail queued before EVIOCGRAB.
         boolean mouseEvent = isMouseEvent(event);
@@ -2235,6 +2273,7 @@ public class MainActivity extends Activity
 
     @Override
     public boolean onGenericMotionEvent(MotionEvent event) {
+        probeStylus(event, "generic");
         if (isMouseEvent(event)) {
             int action = event.getActionMasked();
             if (action == MotionEvent.ACTION_BUTTON_PRESS
