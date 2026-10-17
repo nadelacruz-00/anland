@@ -268,12 +268,14 @@ public final class Touchpad {
     }
 
     /**
-     * Decide left vs right for a single-button (clickpad) physical press. The
-     * pressing finger is the slowest contact -- it is held still to click -- so
-     * each current contact is compared against the last position recognize()
-     * recorded (lastX1 for the primary finger, lastX2 for the second) and the one
-     * that travelled least wins. Left half of the pad => BTN_LEFT (0x110), right
-     * half => BTN_RIGHT (0x111).
+     * Decide left vs right for a single-button (clickpad) physical press. A press
+     * with two or more fingers resting on the pad is a right click -- the physical
+     * equivalent of the two-finger tap this class already implements -- and returns
+     * straight away. Otherwise the pressing finger is the slowest contact -- it is
+     * held still to click -- so each current contact is compared against the last
+     * position recognize() recorded (lastX1 for the primary finger, lastX2 for the
+     * second) and the one that travelled least wins. Left half of the pad =>
+     * BTN_LEFT (0x110), right half => BTN_RIGHT (0x111).
      *
      * Call on the ACTION_BUTTON_PRESS event. The press triggers cancel(), which
      * does not clear the baseline, so the prior positions are still live. Returns
@@ -282,6 +284,10 @@ public final class Touchpad {
     int clickpadButton(MotionEvent event) {
         if (!clickpadBaselineValid || event.getPointerCount() <= 0)
             return 0x110; // BTN_LEFT
+        // The clickpad has no second button, so this is how a right click is
+        // reached without lifting the fingers and tapping again.
+        if (event.getPointerCount() >= 2)
+            return 0x111; // BTN_RIGHT
         int limit = Math.min(event.getPointerCount(), 2);
         int slowestIndex = 0;
         float slowestSpeed = Float.MAX_VALUE;
