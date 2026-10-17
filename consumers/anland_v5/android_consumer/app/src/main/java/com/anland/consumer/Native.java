@@ -50,6 +50,17 @@ public final class Native {
     public void setCustomResolution(int width, int height) { nativeSetCustomResolution(handle, width, height); }
     public void sendTouch(int action, float x, float y, int pointerId) { nativeSendTouch(handle, action, x, y, pointerId); }
     public void sendTouchFrame() { nativeSendTouchFrame(handle); }
+
+    // ---- stylus / tablet tool (see common/protocol.h) ----
+    /** action = TOOL_ACTION_*; caps = TOOL_CAP_* bitmask. */
+    public void sendTool(int action, int toolId, int toolType, int caps) { nativeSendTool(handle, action, toolId, toolType, caps); }
+    /** action = TOOL_POSITION_* (proximity in / motion / proximity out). */
+    public void sendToolPosition(int action, int toolId, float x, float y) { nativeSendToolPosition(handle, action, toolId, x, y); }
+    /** pressure must already be normalised to 0..1; tilt is in radians. */
+    public void sendToolAxes(int toolId, float pressure, float tiltX, float tiltY) { nativeSendToolAxes(handle, toolId, pressure, tiltX, tiltY); }
+    /** button = BTN_STYLUS / BTN_STYLUS2; tip = 1 for tip contact. */
+    public void sendToolButton(int toolId, int button, boolean pressed, boolean tip) { nativeSendToolButton(handle, toolId, button, pressed, tip); }
+    public void sendToolFrame(int toolId, int timeMs) { nativeSendToolFrame(handle, toolId, timeMs); }
     public void sendKey(int action, int keycode) { nativeSendKey(handle, action, keycode); }
     public void sendMouseMotion(float x, float y, float dx, float dy) { nativeSendMouseMotion(handle, x, y, dx, dy); }
     public void sendMouseButton(int button, boolean pressed) { nativeSendMouseButton(handle, button, pressed); }
@@ -84,6 +95,11 @@ public final class Native {
     private static native void nativeSetCustomResolution(long handle, int width, int height);
     private static native void nativeSendTouch(long handle, int action, float x, float y, int pointerId);
     private static native void nativeSendTouchFrame(long handle);
+    private static native void nativeSendTool(long handle, int action, int toolId, int toolType, int caps);
+    private static native void nativeSendToolPosition(long handle, int action, int toolId, float x, float y);
+    private static native void nativeSendToolAxes(long handle, int toolId, float pressure, float tiltX, float tiltY);
+    private static native void nativeSendToolButton(long handle, int toolId, int button, boolean pressed, boolean tip);
+    private static native void nativeSendToolFrame(long handle, int toolId, int timeMs);
     private static native void nativeSendKey(long handle, int action, int keycode);
     private static native void nativeSendMouseMotion(long handle, float x, float y, float dx, float dy);
     private static native void nativeSendMouseButton(long handle, int button, boolean pressed);
