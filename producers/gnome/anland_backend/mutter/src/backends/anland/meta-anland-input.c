@@ -474,9 +474,17 @@ tool_proximity_out (MetaAnlandInput *input)
       input->emitted_tip = FALSE;
     }
 
-  meta_virtual_input_device_native_notify_tool_proximity (
-    META_VIRTUAL_INPUT_DEVICE_NATIVE (input->tablet),
-    g_get_monotonic_time (), input->current_tool, FALSE);
+  /* No Clutter proximity-out is emitted here. Android sends HOVER_EXIT
+   * both when the pen leaves range and when the tip touches down, and the
+   * app maps both to PROXIMITY_OUT, with an immediate PROXIMITY_IN in the
+   * contact case. Emitting the out makes the wayland tablet tool clear its
+   * focus (PROXIMITY_OUT -> set_focus NULL) right before the tip arrives,
+   * and the entire stroke is lost: measured, every tip-down arrived
+   * focusless while the hover motions around it were delivered. The IN
+   * that follows re-establishes proximity, so nothing is emitted here.
+   * shortcut: while the pen is physically away the compositor keeps the
+   * last focus and hover cursor, until the app defers its HOVER_EXIT
+   * leave with a timeout. */
   input->tool_in_proximity = FALSE;
   reset_tool_sample (input);
 }

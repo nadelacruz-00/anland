@@ -1389,6 +1389,17 @@ diff --git a/src/wayland/meta-wayland-tablet-tool.c b/src/wayland/meta-wayland-t
      return;
  
    if (tool->focus_surface != NULL)
+@@ -410,6 +415,10 @@
+ {
+   MetaWaylandTabletTool *tool;
+ 
+   tool = wl_container_of (listener, tool, focus_surface_destroy_listener);
++  /* TEMP DIAGNOSTIC (stylus Stage 3a). Remove before landing. */
++  g_warning ("STYLUS_DIAG focus_destroy tool=%p focus=%p",
++             (void *) tool, (void *) tool->focus_surface);
++
+   meta_wayland_tablet_tool_set_focus (tool, NULL, NULL);
+ }
 @@ -658,7 +663,12 @@
    else
      surface = NULL;
@@ -1402,14 +1413,15 @@ diff --git a/src/wayland/meta-wayland-tablet-tool.c b/src/wayland/meta-wayland-t
    clutter_sprite_invalidate_cursor (sprite);
  }
  
-@@ -928,7 +938,13 @@
+@@ -928,7 +938,14 @@ meta_wayland_tablet_tool_handle_event (MetaWaylandTabletTool *tool,
  meta_wayland_tablet_tool_handle_event (MetaWaylandTabletTool *tool,
                                         const ClutterEvent    *event)
  {
 +  /* TEMP DIAGNOSTIC (stylus Stage 3a). Remove before landing. */
-+  g_warning ("STYLUS_DIAG wl handle type=%d focus=%p pressed=%d",
++  g_warning ("STYLUS_DIAG wl handle type=%d focus=%p evtool=%p ctab=%p pressed=%d",
 +             clutter_event_type (event), (void *) tool->focus_surface,
-+             tool->pressed_buttons);
++             (void *) clutter_event_get_device_tool (event),
++             (void *) tool->current_tablet, tool->pressed_buttons);
 +
    if (!tool->focus_surface)
 +    return CLUTTER_EVENT_PROPAGATE;  if (!tool->focus_surface)
