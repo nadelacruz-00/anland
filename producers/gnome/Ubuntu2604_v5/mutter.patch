@@ -571,7 +571,7 @@ index a41b5ed294..149c989282 100644
  #include "clutter/clutter-virtual-input-device.h"
  
  #define META_TYPE_VIRTUAL_INPUT_DEVICE_NATIVE (meta_virtual_input_device_native_get_type ())
-@@ -26,3 +28,33 @@ G_DECLARE_FINAL_TYPE (MetaVirtualInputDeviceNative,
+@@ -26,3 +28,50 @@
                        meta_virtual_input_device_native,
                        META, VIRTUAL_INPUT_DEVICE_NATIVE,
                        ClutterVirtualInputDevice)
@@ -605,6 +605,23 @@ index a41b5ed294..149c989282 100644
 +  uint64_t                      time_us,
 +  const MetaVirtualTouchEvent  *events,
 +  gsize                         n_events);
++
++/* Anland tablet-tool injection. Kept out of the ClutterVirtualInputDevice
++ * vtable on purpose: the interface models pointer/keyboard/touch, and a
++ * tablet tool needs a ClutterInputDeviceTool (which only the caller can
++ * create) rather than another notify_* entry point. */
++void meta_virtual_input_device_native_notify_tool_proximity (MetaVirtualInputDeviceNative *virtual_device,
++                                                             uint64_t                      time_us,
++                                                             ClutterInputDeviceTool       *tool,
++                                                             gboolean                      in);
++
++void meta_virtual_input_device_native_notify_tool_motion (MetaVirtualInputDeviceNative *virtual_device,
++                                                          uint64_t                      time_us,
++                                                          double                        x,
++                                                          double                        y,
++                                                          double                        pressure,
++                                                          double                        tilt_x,
++                                                          double                        tilt_y);
 diff --git a/src/core/display.c b/src/core/display.c
 index dd75585c23..39bfa6ac52 100644
 --- a/src/core/display.c
@@ -1031,3 +1048,286 @@ index 535cb57112..e5e1d6f504 100644
        manager->private_connection.name =
          g_strdup_printf ("unix:%s%d", X11_TMP_UNIX_PATH,
                           manager->private_connection.display_index);
+diff --git a/src/backends/native/meta-seat-impl.h b/src/backends/native/meta-seat-impl.h
+--- a/src/backends/native/meta-seat-impl.h
++++ b/src/backends/native/meta-seat-impl.h
+@@ -176,6 +176,12 @@
+                                                 float               x,
+                                                 float               y);
+ 
++void meta_seat_impl_notify_tool_proximity_in_impl (MetaSeatImpl           *seat_impl,
++                                                   ClutterInputDevice     *input_device,
++                                                   uint64_t                time_us,
++                                                   ClutterInputDeviceTool *tool,
++                                                   gboolean                in);
++
+ void meta_seat_impl_sync_leds_in_impl (MetaSeatImpl *seat_impl);
+ 
+ void meta_seat_impl_update_xkb_state_in_impl (MetaSeatImpl *seat_impl);
+diff --git a/src/backends/native/meta-seat-impl.c b/src/backends/native/meta-seat-impl.c
+--- a/src/backends/native/meta-seat-impl.c
++++ b/src/backends/native/meta-seat-impl.c
+@@ -1741,6 +1741,30 @@
+   queue_event (seat_impl, event);
+ }
+ 
++void
++meta_seat_impl_notify_tool_proximity_in_impl (MetaSeatImpl           *seat_impl,
++                                              ClutterInputDevice     *input_device,
++                                              uint64_t                time_us,
++                                              ClutterInputDeviceTool *tool,
++                                              gboolean                in)
++{
++  MetaInputDeviceNative *device_native =
++    META_INPUT_DEVICE_NATIVE (input_device);
++
++  (void) seat_impl;
++
++  /* The tool is borrowed for the duration of the proximity event: the caller
++   * keeps it alive. The seat core reads it back through last_tool when it
++   * builds the ClutterEvent. */
++  if (in)
++    device_native->last_tool = tool;
++
++  notify_proximity (input_device, time_us, in);
++
++  if (!in)
++    device_native->last_tool = NULL;
++}
++
+ static void
+ notify_pad_button (ClutterInputDevice *input_device,
+                    uint64_t            time_us,
+diff --git a/src/backends/native/meta-virtual-input-device-native.c b/src/backends/native/meta-virtual-input-device-native.c
+--- a/src/backends/native/meta-virtual-input-device-native.c
++++ b/src/backends/native/meta-virtual-input-device-native.c
+@@ -1134,3 +1134,141 @@
+                                                  G_PARAM_CONSTRUCT_ONLY);
+   g_object_class_install_properties (object_class, PROP_LAST, obj_props);
+ }
++
++typedef struct
++{
++  uint64_t time_us;
++  ClutterInputDeviceTool *tool;
++  gboolean in;
++} MetaVirtualEventToolProximity;
++
++typedef struct
++{
++  uint64_t time_us;
++  double x;
++  double y;
++  double pressure;
++  double tilt_x;
++  double tilt_y;
++} MetaVirtualEventToolMotion;
++
++static void
++meta_virtual_event_tool_proximity_free (MetaVirtualEventToolProximity *event)
++{
++  g_clear_object (&event->tool);
++  g_free (event);
++}
++
++static gboolean
++notify_tool_proximity_in_impl (GTask *task)
++{
++  MetaVirtualInputDeviceNative *virtual_native =
++    g_task_get_source_object (task);
++  MetaSeatNative *seat_native =
++    meta_virtual_input_device_native_get_seat_native (virtual_native);
++  MetaVirtualEventToolProximity *event = g_task_get_task_data (task);
++
++  if (event->time_us == CLUTTER_CURRENT_TIME)
++    event->time_us = g_get_monotonic_time ();
++
++  meta_seat_impl_notify_tool_proximity_in_impl (seat_native->impl,
++                                                virtual_native->impl_state->device,
++                                                event->time_us,
++                                                event->tool,
++                                                event->in);
++  g_task_return_boolean (task, TRUE);
++  return G_SOURCE_REMOVE;
++}
++
++void
++meta_virtual_input_device_native_notify_tool_proximity (MetaVirtualInputDeviceNative *virtual_native,
++                                                        uint64_t                      time_us,
++                                                        ClutterInputDeviceTool       *tool,
++                                                        gboolean                      in)
++{
++  MetaSeatNative *seat_native;
++  MetaVirtualEventToolProximity *event;
++  GTask *task;
++
++  g_return_if_fail (META_IS_VIRTUAL_INPUT_DEVICE_NATIVE (virtual_native));
++  g_return_if_fail (virtual_native->impl_state != NULL);
++  g_return_if_fail (tool != NULL);
++
++  seat_native = meta_virtual_input_device_native_get_seat_native (virtual_native);
++  event = g_new0 (MetaVirtualEventToolProximity, 1);
++  event->time_us = time_us;
++  event->tool = g_object_ref (tool);
++  event->in = in;
++
++  task = g_task_new (virtual_native, NULL, NULL, NULL);
++  g_task_set_task_data (task, event,
++                        (GDestroyNotify) meta_virtual_event_tool_proximity_free);
++  meta_seat_impl_run_input_task (seat_native->impl, task,
++                                 (GSourceFunc) notify_tool_proximity_in_impl);
++  g_object_unref (task);
++}
++
++static gboolean
++notify_tool_motion_in_impl (GTask *task)
++{
++  MetaVirtualInputDeviceNative *virtual_native =
++    g_task_get_source_object (task);
++  MetaSeatNative *seat_native =
++    meta_virtual_input_device_native_get_seat_native (virtual_native);
++  MetaVirtualEventToolMotion *event = g_task_get_task_data (task);
++  double *axes;
++
++  if (event->time_us == CLUTTER_CURRENT_TIME)
++    event->time_us = g_get_monotonic_time ();
++
++  /* clutter_event_motion_new() does NOT copy the axes: it stores the pointer
++   * and g_free()s it when the event is freed. The array must therefore be
++   * heap-allocated and ownership handed over, exactly as the native backend
++   * does in translate_tablet_axes(). A stack array here aborts with
++   * "free(): invalid pointer" as soon as each motion event is disposed. */
++  axes = g_new0 (double, CLUTTER_INPUT_AXIS_LAST);
++  axes[CLUTTER_INPUT_AXIS_PRESSURE] = event->pressure;
++  axes[CLUTTER_INPUT_AXIS_XTILT] = event->tilt_x;
++  axes[CLUTTER_INPUT_AXIS_YTILT] = event->tilt_y;
++
++  meta_seat_impl_notify_absolute_motion_in_impl (seat_native->impl,
++                                                 virtual_native->impl_state->device,
++                                                 event->time_us,
++                                                 (float) event->x,
++                                                 (float) event->y,
++                                                 axes);
++  g_task_return_boolean (task, TRUE);
++  return G_SOURCE_REMOVE;
++}
++
++void
++meta_virtual_input_device_native_notify_tool_motion (MetaVirtualInputDeviceNative *virtual_native,
++                                                     uint64_t                      time_us,
++                                                     double                        x,
++                                                     double                        y,
++                                                     double                        pressure,
++                                                     double                        tilt_x,
++                                                     double                        tilt_y)
++{
++  MetaSeatNative *seat_native;
++  MetaVirtualEventToolMotion *event;
++  GTask *task;
++
++  g_return_if_fail (META_IS_VIRTUAL_INPUT_DEVICE_NATIVE (virtual_native));
++  g_return_if_fail (virtual_native->impl_state != NULL);
++
++  seat_native = meta_virtual_input_device_native_get_seat_native (virtual_native);
++  event = g_new0 (MetaVirtualEventToolMotion, 1);
++  event->time_us = time_us;
++  event->x = x;
++  event->y = y;
++  event->pressure = pressure;
++  event->tilt_x = tilt_x;
++  event->tilt_y = tilt_y;
++
++  task = g_task_new (virtual_native, NULL, NULL, NULL);
++  g_task_set_task_data (task, event, g_free);
++  meta_seat_impl_run_input_task (seat_native->impl, task,
++                                 (GSourceFunc) notify_tool_motion_in_impl);
++  g_object_unref (task);
++}
+diff --git a/src/backends/native/meta-input-device-tool-native.c b/src/backends/native/meta-input-device-tool-native.c
+--- a/src/backends/native/meta-input-device-tool-native.c
++++ b/src/backends/native/meta-input-device-tool-native.c
+@@ -39,7 +39,8 @@
+   MetaInputDeviceToolNative *tool = META_INPUT_DEVICE_TOOL_NATIVE (object);
+ 
+   g_hash_table_unref (tool->button_map);
+-  libinput_tablet_tool_unref (tool->tool);
++  if (tool->tool)
++    libinput_tablet_tool_unref (tool->tool);
+   meta_bezier_free (tool->bezier);
+ 
+   G_OBJECT_CLASS (meta_input_device_tool_native_parent_class)->finalize (object);
+@@ -197,4 +198,25 @@
+ 
+   return GPOINTER_TO_UINT (g_hash_table_lookup (evdev_tool->button_map,
+                                                 GUINT_TO_POINTER (button)));
++}
++
++ClutterInputDeviceTool *
++meta_input_device_tool_native_new_virtual (uint64_t                    serial,
++                                           ClutterInputDeviceToolType  type,
++                                           ClutterInputAxisFlags       axes)
++{
++  MetaInputDeviceToolNative *evdev_tool;
++
++  evdev_tool = g_object_new (META_TYPE_INPUT_DEVICE_TOOL_NATIVE,
++                             "type", type,
++                             "serial", serial,
++                             "id", serial,
++                             "axes", axes,
++                             NULL);
++
++  /* No libinput tool behind it: pressure is not re-mapped through a bezier
++   * curve, the caller supplies the already-normalised axis values. */
++  init_pressurecurve (evdev_tool);
++
++  return CLUTTER_INPUT_DEVICE_TOOL (evdev_tool);
+ }
+diff --git a/src/backends/native/meta-input-device-tool-native.h b/src/backends/native/meta-input-device-tool-native.h
+--- a/src/backends/native/meta-input-device-tool-native.h
++++ b/src/backends/native/meta-input-device-tool-native.h
+@@ -59,4 +59,10 @@
+                                                                                 uint32_t                    button,
+                                                                                 GDesktopStylusButtonAction  evcode);
+ 
++/* Build a tablet tool that is not backed by libinput. Used by the Anland
++ * backend, which synthesises tool events from the Android consumer. */
++ClutterInputDeviceTool *  meta_input_device_tool_native_new_virtual (uint64_t                    serial,
++                                                                     ClutterInputDeviceToolType  type,
++                                                                     ClutterInputAxisFlags       axes);
++
+ G_END_DECLS
+diff --git a/src/wayland/meta-wayland-seat.c b/src/wayland/meta-wayland-seat.c
+--- a/src/wayland/meta-wayland-seat.c
++++ b/src/wayland/meta-wayland-seat.c
+@@ -250,6 +250,14 @@
+       {
+         ClutterInputDevice *device;
+ 
++        /* A tool keeps its focus until it leaves proximity (PROXIMITY_OUT
++         * clears it below). A generic focus change that carries no surface -
++         * pointer or touch focus moving, a pick that lands on the stage - must
++         * not tear the tool's focus down, or the next tip event arrives with
++         * focus_surface == NULL and is silently dropped. */
++        if (!surface)
++          break;
++
+         device = clutter_sprite_get_sprite_device (CLUTTER_SPRITE (focus));
+         meta_wayland_tablet_seat_focus_surface (seat->tablet_seat,
+                                                 device,
+diff --git a/src/backends/native/meta-input-device-native.c b/src/backends/native/meta-input-device-native.c
+--- a/src/backends/native/meta-input-device-native.c
++++ b/src/backends/native/meta-input-device-native.c
+@@ -545,6 +545,13 @@
+     return;
+ 
+   meta_viewport_info_get_extents (viewports, &stage_width, &stage_height);
++
++  /* No usable viewport geometry (e.g. a backend with a virtual monitor): there
++   * is nothing to translate, and a degenerate extent would clamp every tablet
++   * coordinate to 0. Leave the coordinates as the producer sent them. */
++  if (stage_width <= 0 || stage_height <= 0)
++    return;
++
+   x_d = *x / stage_width;
+   y_d = *y / stage_height;
+ 
