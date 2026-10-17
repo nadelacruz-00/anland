@@ -1331,3 +1331,20 @@ diff --git a/src/backends/native/meta-input-device-native.c b/src/backends/nativ
    x_d = *x / stage_width;
    y_d = *y / stage_height;
  
+
+diff --git a/src/wayland/meta-wayland-touch.c b/src/wayland/meta-wayland-touch.c
+--- a/src/wayland/meta-wayland-touch.c
++++ b/src/wayland/meta-wayland-touch.c
+@@ -656,6 +656,12 @@
+ {
+   MetaWaylandSurface *subsurface;
+ 
++  /* A touch cancel clears the focus surface while the entry stays in the
++   * touches hash (see meta_wayland_touch_cancel); such an entry must not
++   * match a grab, it would deref NULL below. */
++  if (!touch_info->focus_surface)
++    return FALSE;
++
+   if (touch_info->focus_surface->surface == surface)
+     return TRUE;
+ 
