@@ -485,7 +485,10 @@ build_pw (MetaAnlandAudio *audio)
                        PW_KEY_MEDIA_CLASS, "Audio/Source",
                        PW_KEY_NODE_NAME, "anland-mic",
                        PW_KEY_NODE_DESCRIPTION, "Anland remote microphone",
-                       PW_KEY_PRIORITY_SESSION, "1010",
+                       /* Above anland-speaker (1010): WirePlumber also offers sinks as
+                        * default-source candidates and keeps the first on a tie, which
+                        * made the speaker monitor the default "microphone". */
+                       PW_KEY_PRIORITY_SESSION, "2000",
                        PW_KEY_PRIORITY_DRIVER, "1010",
                        NULL));
   if (!audio->source)
