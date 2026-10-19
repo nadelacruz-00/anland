@@ -12,7 +12,10 @@
 #include "backends/anland/libdisplay_producer/anland_device.h"
 #include "backends/meta-backend-private.h"
 #include "backends/meta-fd-source.h"
+#include "backends/meta-monitor-config-manager.h"
+#include "backends/meta-monitor-config-utils.h"
 #include "backends/meta-monitor-manager-private.h"
+#include "backends/meta-monitor-private.h"
 #include "backends/meta-renderer.h"
 #include "backends/meta-renderer-view.h"
 #include "backends/meta-stage-view-private.h"
@@ -412,6 +415,82 @@ connect_device (MetaBackendAnland  *backend,
   return TRUE;
 }
 
+/* The stored layout (monitors.xml) names one exact refresh rate. Android changes the
+ * Anland panel rate often (it drops to 60 Hz while a camera runs), and every change
+ * rebuilds the virtual monitor with only the new rate, so mutter can no longer apply
+ * the stored layout and falls back to its default (scale 1). Re-apply the stored
+ * layout with only the refresh rate swapped for the current one. TEMPORARY keeps
+ * monitors.xml as the user saved it; the next rate change repeats this. */
+static void
+reapply_stored_layout_at_current_rate (MetaBackendAnland *backend)
+{
+  MetaMonitorManager *monitor_manager =
+    meta_backend_get_monitor_manager (META_BACKEND (backend));
+  MetaMonitorConfigManager *config_manager =
+    meta_monitor_manager_get_config_manager (monitor_manager);
+  MetaMonitorsConfig *stored;
+  MetaMonitorsConfig *current;
+  g_autoptr (MetaMonitorsConfig) config = NULL;
+  g_autoptr (GError) error = NULL;
+  GList *logical_monitor_configs;
+  gboolean changed = FALSE;
+  float refresh_rate;
+
+  stored = meta_monitor_config_manager_get_stored (config_manager);
+  current = meta_monitor_config_manager_get_current (config_manager);
+  if (!stored || !current || stored == current)
+    return;
+
+  refresh_rate = backend->output.refresh_mhz > 0 ?
+    backend->output.refresh_mhz / 1000.0f : 60.0f;
+
+  logical_monitor_configs =
+    meta_clone_logical_monitor_config_list (stored->logical_monitor_configs);
+  for (GList *l = logical_monitor_configs; l; l = l->next)
+    {
+      MetaLogicalMonitorConfig *logical_monitor_config = l->data;
+
+      for (GList *m = logical_monitor_config->monitor_configs; m; m = m->next)
+        {
+          MetaMonitorConfig *monitor_config = m->data;
+          MetaMonitorModeSpec *mode_spec = monitor_config->mode_spec;
+
+          /* Only a refresh-rate difference is bridged; a different size means the
+           * stored layout is genuinely stale and mutter's fallback is right. */
+          if (mode_spec->width != (int) backend->output.width ||
+              mode_spec->height != (int) backend->output.height)
+            {
+              g_list_free_full (logical_monitor_configs,
+                                (GDestroyNotify) meta_logical_monitor_config_free);
+              return;
+            }
+          if (fabsf (mode_spec->refresh_rate - refresh_rate) > 0.01f)
+            {
+              mode_spec->refresh_rate = refresh_rate;
+              changed = TRUE;
+            }
+        }
+    }
+
+  if (!changed)
+    {
+      g_list_free_full (logical_monitor_configs,
+                        (GDestroyNotify) meta_logical_monitor_config_free);
+      return;
+    }
+
+  config = meta_monitors_config_new (monitor_manager, logical_monitor_configs,
+                                     stored->layout_mode,
+                                     META_MONITORS_CONFIG_FLAG_NONE);
+  if (!meta_monitor_manager_apply_monitors_config (monitor_manager, config,
+                                                   META_MONITORS_CONFIG_METHOD_TEMPORARY,
+                                                   &error))
+    g_warning ("Anland: could not keep the stored display layout at %.3f Hz: %s",
+               refresh_rate, error->message);
+  else
+    g_message ("Anland: kept the stored display layout at %.3f Hz", refresh_rate);
+}
+
 static gboolean
 update_virtual_monitor (MetaBackendAnland  *backend,
                         GError            **error)
@@ -448,6 +527,7 @@ update_virtual_monitor (MetaBackendAnland  *backend,
                                      refresh_rate);
 #endif
       meta_monitor_manager_reload (monitor_manager);
+      reapply_stored_layout_at_current_rate (backend);
       return TRUE;
     }
 
@@ -470,6 +550,7 @@ update_virtual_monitor (MetaBackendAnland  *backend,
     return FALSE;
 
   meta_monitor_manager_reload (monitor_manager);
+  reapply_stored_layout_at_current_rate (backend);
   return TRUE;
 }
 
