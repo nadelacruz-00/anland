@@ -494,6 +494,40 @@ static void unmap_shm(struct cam *cam)
     cam->shm_requested = false;
 }
 
+/* Copy one consumer frame (w*h*3/2, Y stride w) into dst as NV12, the format the node
+ * advertises. libwebrtc (Firefox/Zen, Chromium) has no NV21 mapping: offered only NV21
+ * the camera had zero usable formats and Zen crashed on the empty list. NV21 -> NV12
+ * is a swap of each chroma byte pair; I420 -> NV12 interleaves the U and V planes. */
+static void copy_frame_as_nv12(uint8_t *dst, const uint8_t *src, uint32_t w, uint32_t h,
+                               int fmt)
+{
+    const size_t y_size = (size_t)w * h;
+    const size_t c_size = y_size / 2;
+
+    memcpy(dst, src, y_size);
+    dst += y_size;
+    src += y_size;
+    switch (fmt) {
+    case CAM_FMT_NV21:
+        for (size_t i = 0; i + 1 < c_size; i += 2) {
+            dst[i] = src[i + 1];      /* U */
+            dst[i + 1] = src[i];      /* V */
+        }
+        break;
+    case CAM_FMT_I420: {
+        const uint8_t *u = src, *v = src + c_size / 2;
+        for (size_t i = 0; i < c_size / 2; i++) {
+            dst[2 * i] = u[i];
+            dst[2 * i + 1] = v[i];
+        }
+        break;
+    }
+    default:   /* CAM_FMT_NV12 */
+        memcpy(dst, src, c_size);
+        break;
+    }
+}
+
 static void handle_stream_msg(struct cam *cam, const struct cam_stream_msg *m, int rfd)
 {
     switch (m->type) {
@@ -548,16 +582,18 @@ static void handle_stream_msg(struct cam *cam, const struct cam_stream_msg *m, i
             }
             if (cam->frame_cap >= bytes && bytes > 0) {
                 /* Copy out of the slot promptly so the consumer can reuse it. */
-                memcpy(cam->frame, cam->shm + (size_t)slot * cam->slot_bytes, bytes);
+                copy_frame_as_nv12(cam->frame, cam->shm + (size_t)slot * cam->slot_bytes,
+                                   w, h, fmt);
                 cam->frame_size = bytes;
                 cam->have_frame = true;
             }
         }
         /* Release the slot (even if we couldn't read, so the consumer never wedges). */
         send_stream(cam, CAM_STREAM_DONE, slot);
-        if (valid && (w != cam->fmt_w || h != cam->fmt_h ||
-                      fmt != cam->fmt_code))
-            renegotiate_format(cam, w, h, fmt);
+        /* The pixel layout is always converted to NV12 above; only a size change
+         * needs a renegotiation. */
+        if (valid && (w != cam->fmt_w || h != cam->fmt_h))
+            renegotiate_format(cam, w, h, CAM_FMT_NV12);
         break;
     }
     default:
@@ -821,9 +857,9 @@ static int create_node(struct cam *cam)
         cam->fmt_w = CAM_DEF_W;
         cam->fmt_h = CAM_DEF_H;
     }
-    /* The consumer always delivers NV21, so advertise it from the start -- no live
-     * format switch (which crashes downstream gst). Only resolution ever renegotiates. */
-    cam->fmt_code = CAM_FMT_NV21;
+    /* Advertise NV12 from the start (frames are converted on copy) -- no live format
+     * switch (which crashes downstream gst). Only resolution ever renegotiates. */
+    cam->fmt_code = CAM_FMT_NV12;
     return connect_node(cam);
 }
 
