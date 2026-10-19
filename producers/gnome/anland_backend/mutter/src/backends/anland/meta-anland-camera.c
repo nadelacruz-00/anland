@@ -976,6 +976,21 @@ void meta_anland_camera_clear(struct anland_camera *c)
     pw_thread_loop_unlock(c->loop);
 }
 
+/* True while a consumer's control channel is attached. The backend uses this to keep
+ * the camera across display-only changes instead of re-requesting it: the consumer
+ * treats every re-allocation as "previous producer gone" and stops recording. */
+gboolean meta_anland_camera_has_resources(struct anland_camera *c)
+{
+    gboolean attached;
+
+    if (!c)
+        return FALSE;
+    pw_thread_loop_lock(c->loop);
+    attached = c->ctrl_fd >= 0;
+    pw_thread_loop_unlock(c->loop);
+    return attached;
+}
+
 struct anland_camera *meta_anland_camera_new(void)
 {
     pw_init(NULL, NULL);

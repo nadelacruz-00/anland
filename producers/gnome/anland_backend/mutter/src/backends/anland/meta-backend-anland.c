@@ -94,6 +94,7 @@ struct _MetaBackendAnland
 G_DEFINE_TYPE (MetaBackendAnland, meta_backend_anland, META_TYPE_BACKEND_NATIVE)
 
 static void deactivate_consumer (MetaBackendAnland *backend);
+static void deactivate_consumer_for_view_change (MetaBackendAnland *backend);
 static void invalidate_consumer (MetaBackendAnland *backend);
 static void dispatch_present_events (MetaBackendAnland *backend);
 static void release_stage_view (MetaBackendAnland *backend);
@@ -258,6 +259,11 @@ static void
 request_camera_resources (MetaBackendAnland *backend)
 {
   if (!backend->camera)
+    return;
+
+  /* Still attached from before a display-only change: the camera fds stay valid on
+   * the same transport, and re-requesting would make the consumer stop recording. */
+  if (meta_anland_camera_has_resources (backend->camera))
     return;
 
   anland_device_request_resources (backend->device,
@@ -607,10 +613,12 @@ complete_pending_frame (MetaBackendAnland *backend)
 }
 
 static void
-deactivate_consumer (MetaBackendAnland *backend)
+deactivate_consumer_full (MetaBackendAnland *backend,
+                          gboolean           keep_camera)
 {
   meta_anland_audio_set_fd (backend->audio, -1);
-  meta_anland_camera_clear (backend->camera);
+  if (!keep_camera)
+    meta_anland_camera_clear (backend->camera);
   meta_anland_clipboard_set_device (backend->clipboard, NULL);
 
   if (backend->input_source)
@@ -733,6 +741,21 @@ apply_render_target (MetaBackendAnland *backend)
   clutter_stage_view_schedule_update_now (CLUTTER_STAGE_VIEW (backend->stage_view));
 }
 
+/* Session drop: release everything, including the camera channel. */
+static void
+deactivate_consumer (MetaBackendAnland *backend)
+{
+  deactivate_consumer_full (backend, FALSE);
+}
+
+/* Display-only change on the same transport (refresh rate, output size, stage
+ * rebuild): keep the camera attached and recording. */
+static void
+deactivate_consumer_for_view_change (MetaBackendAnland *backend)
+{
+  deactivate_consumer_full (backend, TRUE);
+}
+
 static void
 apply_output_change (MetaBackendAnland       *backend,
                      const anland_scene_event_t *event)
@@ -754,7 +777,7 @@ apply_output_change (MetaBackendAnland       *backend,
   /* Match the display-refresh path: detach presentation and retire the local
    * pending frame before release_stage_view(), then re-import for the new view.
    * This is a view change, not a transport-session drop. */
-  deactivate_consumer (backend);
+  deactivate_consumer_for_view_change (backend);
   backend->output.width = event->u.output.width;
   backend->output.height = event->u.output.height;
   backend->output.refresh_mhz = event->u.output.refresh_mhz;
@@ -1251,7 +1274,10 @@ on_input_display_refresh (uint32_t refresh_mhz,
     return;
 
   backend->output.refresh_mhz = refresh_mhz;
-  deactivate_consumer (backend);
+  /* A refresh-rate change is display-only. Clearing the camera here caused a loop:
+   * the Android panel drops 120->60 Hz when the camera opens, which stopped the
+   * camera, which restored 120 Hz, which re-activated and restarted it (~2 Hz). */
+  deactivate_consumer_for_view_change (backend);
   if (!update_virtual_monitor (backend, NULL))
     {
       clear_device (backend);
@@ -1349,7 +1375,7 @@ meta_backend_anland_update_stage (MetaBackend *backend)
   gboolean had_stage_view = backend_anland->stage_view != NULL;
 
   if (backend_anland->consumer_active)
-    deactivate_consumer (backend_anland);
+    deactivate_consumer_for_view_change (backend_anland);
   release_stage_view (backend_anland);
 
   parent_class->update_stage (backend);
