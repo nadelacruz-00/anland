@@ -96,6 +96,15 @@ struct cam {
     bool                  recording;    /* we've told the consumer to START on ctrl */
     bool                  process_seen; /* one-shot debug: on_process was called */
 
+    /* An app is linked: our port has a negotiated format. PipeWire clears it when the
+     * last consumer unlinks. Stream state alone can't tell: the node follows the
+     * always-running speaker driver, so it stays STREAMING after the app leaves. */
+    bool                  has_format;
+    /* Grace period before STOP after the format is cleared, so a renegotiation
+     * (clear then set) never stops and restarts the Android camera. */
+    struct spa_source    *stop_timer;
+    bool                  stop_pending;
+
     /* Current negotiated node format. The node always advertises exactly this, and we
      * re-negotiate it to match the resolution + pixel layout the consumer actually sends. */
     uint32_t              fmt_w, fmt_h;
@@ -144,6 +153,9 @@ static int  build_pw(struct anland_camera *c);
 static void teardown_pw(struct anland_camera *c);
 static void create_nodes(struct anland_camera *c);
 static void destroy_nodes(struct anland_camera *c);
+static int  create_node(struct cam *cam);
+static void destroy_node(struct cam *cam);
+static void on_stream_readable(void *data, int fd, uint32_t mask);
 static void attach_fd(struct cam *cam, int fd);
 static void detach_fd(struct cam *cam);
 static void clear_resources_locked(struct anland_camera *c);
@@ -375,8 +387,12 @@ static void request_shm(struct cam *cam)
  * socket + stream fd. Requests the consumer at the node's current format. */
 static void update_recording(struct cam *cam)
 {
-    const bool want = cam->streaming && cam->stream_fd >= 0 && cam->owner->ctrl_fd >= 0;
+    const bool want = cam->streaming && cam->has_format &&
+                      cam->stream_fd >= 0 && cam->owner->ctrl_fd >= 0;
     if (want == cam->recording)
+        return;
+    /* Viewer just left: the grace timer decides (on_stop_timer), not other paths. */
+    if (!want && cam->stop_pending)
         return;
     if (want) {
         uint8_t p[5];
@@ -656,11 +672,62 @@ static void on_stream_state_changed(void *data, enum pw_stream_state old,
 /* The format was negotiated: parse it and declare a buffer pool of the matching size.
  * Without this PipeWire never allocates correctly-sized buffers and
  * pw_stream_dequeue_buffer() returns NULL forever, so on_process can never emit. */
+#define CAM_STOP_GRACE_SECS 2
+
+static void arm_stop_timer(struct cam *cam, bool arm)
+{
+    struct timespec value = { .tv_sec = arm ? CAM_STOP_GRACE_SECS : 0, .tv_nsec = 0 };
+
+    if (!cam->stop_timer)
+        return;
+    pw_loop_update_timer(pw_thread_loop_get_loop(cam->owner->loop), cam->stop_timer,
+                         &value, NULL, false);
+    cam->stop_pending = arm;
+}
+
+/* Grace period over: if no app re-linked, stop the Android camera. */
+static void on_stop_timer(void *data, uint64_t expirations)
+{
+    struct cam *cam = data;
+    (void)expirations;
+
+    cam->stop_pending = false;
+    if (!cam->has_format && cam->recording)
+        g_message("anland-camera: camera %d has no viewer, stopping", cam->index);
+    update_recording(cam);
+    /* Rebuild the node. It follows the always-running anland-speaker driver, so it
+     * stays RUNNING after the last viewer and GNOME Shell keeps its "camera in use"
+     * indicator lit although the Android camera is off. A fresh node is suspended
+     * and links normally (pw_stream_set_active(false) instead left it unable to
+     * negotiate with the next viewer). The stream fd, its shm and reader survive. */
+    if (!cam->has_format && cam->node && cam->owner->pw_connected) {
+        struct pw_loop *loop = pw_thread_loop_get_loop(cam->owner->loop);
+        destroy_node(cam);
+        create_node(cam);
+        if (cam->node && cam->stream_fd >= 0 && !cam->io)
+            cam->io = pw_loop_add_io(loop, cam->stream_fd, SPA_IO_IN, false,
+                                     on_stream_readable, cam);
+    }
+}
+
 static void on_param_changed(void *data, uint32_t id, const struct spa_pod *param)
 {
     struct cam *cam = data;
-    if (!param || id != SPA_PARAM_Format)
+    if (id != SPA_PARAM_Format)
         return;
+
+    if (!param) {
+        /* Last consumer unlinked. Stop after the grace period unless one returns. */
+        cam->has_format = false;
+        if (cam->recording)
+            arm_stop_timer(cam, true);
+        return;
+    }
+    if (!cam->has_format)
+        g_message("anland-camera: camera %d has a viewer", cam->index);
+    cam->has_format = true;
+    if (cam->stop_pending)
+        arm_stop_timer(cam, false);
 
     uint32_t mtype, msubtype;
     if (spa_format_parse(param, &mtype, &msubtype) < 0 ||
@@ -693,6 +760,7 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
         SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(
             (1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd)));
     pw_stream_update_params(cam->node, params, 1);
+    update_recording(cam);   /* a viewer is linked: START if not already recording */
 }
 
 static const struct pw_stream_events stream_events = {
@@ -748,6 +816,7 @@ static int create_node(struct cam *cam)
     cam->streaming = false;
     cam->recording = false;
     cam->process_seen = false;
+    cam->has_format = false;
     if (cam->fmt_w == 0 || cam->fmt_h == 0) {
         cam->fmt_w = CAM_DEF_W;
         cam->fmt_h = CAM_DEF_H;
@@ -792,6 +861,9 @@ static void destroy_node(struct cam *cam)
     }
     cam->streaming = false;
     cam->recording = false;
+    cam->has_format = false;
+    if (cam->stop_pending)
+        arm_stop_timer(cam, false);
 }
 
 static void destroy_nodes(struct anland_camera *c)
@@ -1019,6 +1091,12 @@ struct anland_camera *meta_anland_camera_new(void)
                                            on_reconnect_timer, c);
     if (!c->reconnect_timer)
         goto fail;
+    for (int i = 0; i < MAX_CAMERAS; i++) {
+        c->cams[i].stop_timer = pw_loop_add_timer(pw_thread_loop_get_loop(c->loop),
+                                                  on_stop_timer, &c->cams[i]);
+        if (!c->cams[i].stop_timer)
+            goto fail;
+    }
 
     if (pw_thread_loop_start(c->loop) < 0)
         goto fail;
@@ -1038,6 +1116,10 @@ struct anland_camera *meta_anland_camera_new(void)
 fail:
     if (c->loop_started)
         pw_thread_loop_stop(c->loop);
+    for (int i = 0; i < MAX_CAMERAS; i++)
+        if (c->cams[i].stop_timer)
+            pw_loop_destroy_source(pw_thread_loop_get_loop(c->loop),
+                                   c->cams[i].stop_timer);
     if (c->reconnect_timer)
         pw_loop_destroy_source(pw_thread_loop_get_loop(c->loop),
                                c->reconnect_timer);
@@ -1063,6 +1145,9 @@ void meta_anland_camera_free(struct anland_camera *c)
         unmap_shm(cam);
         free(cam->frame);
         cam->frame = NULL;
+        if (cam->stop_timer)
+            pw_loop_destroy_source(pw_thread_loop_get_loop(c->loop), cam->stop_timer);
+        cam->stop_timer = NULL;
     }
     if (c->reconnect_timer)
         pw_loop_destroy_source(pw_thread_loop_get_loop(c->loop), c->reconnect_timer);
