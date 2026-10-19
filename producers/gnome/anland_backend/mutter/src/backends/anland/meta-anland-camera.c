@@ -72,6 +72,13 @@ _Static_assert(sizeof(struct cam_stream_msg) == 12,
 #define CAM_DEF_H   720
 #define CAM_FPS     30
 
+/* Largest size ever requested from the consumer (same rule as the consumer's
+ * camera_size.h), and the standard size requested when it reports more. */
+#define CAM_CAP_W   1920
+#define CAM_CAP_H   1080
+#define CAM_CLAMP_W 1280
+#define CAM_CLAMP_H 720
+
 #define MAX_CAMERAS 8
 #define RECONNECT_SECS 1
 #define MAX_CAMERA_FRAME_BYTES (256U * 1024U * 1024U)
@@ -217,6 +224,17 @@ handle_camera_info(struct anland_camera *c,
         if (!camera_frame_size(width, height, &frame_size))
             return false;
 
+        /* Never ask the consumer for more than 1080p, whatever it reports: an older
+         * consumer reports the full sensor size, and streaming it once OOM'd the whole
+         * Android device. 1280x720 is listed by practically every camera; the consumer
+         * caps by the same rule (camera_size.h). */
+        if (width > CAM_CAP_W || height > CAM_CAP_H) {
+            g_message("anland-camera: camera %d reports %ux%u, requesting %ux%u",
+                      i, width, height, CAM_CLAMP_W, CAM_CLAMP_H);
+            width = CAM_CLAMP_W;
+            height = CAM_CLAMP_H;
+        }
+
         if (!cam->node) {
             cam->fmt_w = width;
             cam->fmt_h = height;
@@ -245,10 +263,20 @@ consume_control_messages(struct anland_camera *c)
         if (c->ctrl_buffer_len < message_size)
             return true;
 
-        if (!c->info_pending ||
-            header.type != CAMERA_CTRL_INFO_REPLY || header.reserved != 0 ||
-            !handle_camera_info(c, c->ctrl_buffer + sizeof(header), header.len))
+        /* Accept every well-formed INFO_REPLY, not only the one we are waiting for.
+         * The consumer keeps one control socket per window and hands it over again
+         * on each session activation, so a reply to an earlier GET_INFO can arrive
+         * after a newer request was sent. Rejecting that duplicate used to tear down
+         * the whole camera channel at login (no START ever sent, grey frames
+         * forever). The reply only carries sizes, so handling it twice is harmless. */
+        if (header.type != CAMERA_CTRL_INFO_REPLY || header.reserved != 0 ||
+            !handle_camera_info(c, c->ctrl_buffer + sizeof(header), header.len)) {
+            g_warning("anland-camera: rejected control message type 0x%02x "
+                      "(reserved %u, len %u, %d camera(s) attached, %s)",
+                      header.type, header.reserved, header.len, c->num_cameras,
+                      c->info_pending ? "reply pending" : "no reply pending");
             return false;
+        }
 
         c->info_pending = false;
         c->ctrl_buffer_len -= message_size;
