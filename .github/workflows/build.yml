@@ -59,6 +59,7 @@ jobs:
         working-directory: consumers/anland_v5/android_consumer
         run: |
           sh app/src/test/native/run_input_grab_tests.sh
+          sh app/src/test/native/run_camera_size_tests.sh
           ./gradlew testPlainDebugUnitTest
 
       - name: Build APK

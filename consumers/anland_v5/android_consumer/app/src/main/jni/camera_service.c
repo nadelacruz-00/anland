@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "camera_service.h"
+#include "camera_size.h"
 
 #include <android/hardware_buffer.h>
 #include <android/log.h>
@@ -29,6 +30,9 @@
 
 /* Fallback slot size when a camera's max resolution is unknown (1080p I420). */
 #define CAM_FALLBACK_BYTES (1920 * 1080 * 3 / 2)
+
+/* Upper bound on YUV_420_888 output sizes kept per camera. */
+#define CAM_MAX_SIZES 64
 
 /*
  * Per-client channel set: one per consumer window (one-to-one with its producer),
@@ -65,8 +69,10 @@ struct camera_client {
 static struct camera_hw {
     ACameraManager *cam_mgr;
     char           *cam_ids[MAX_CAMERAS];
-    int             max_w[MAX_CAMERAS];
+    int             max_w[MAX_CAMERAS];   /* largest supported size within CAM_CAP_* */
     int             max_h[MAX_CAMERAS];
+    struct cam_size sizes[MAX_CAMERAS][CAM_MAX_SIZES];   /* YUV_420_888 outputs */
+    size_t          num_sizes[MAX_CAMERAS];
     int             num_cameras;
 
     pthread_mutex_t cap_lock[MAX_CAMERAS];      /* guard start/stop races */
@@ -328,6 +334,20 @@ static void on_frame_available(void *context, AImageReader *reader)
         int fmt = cam_pack_frame(cam, slot, yData, yRow, uData, uRow, uPix,
                                  vData, vRow, vPix, w, h);
         TracyCZoneEnd(zPack);
+        if (fmt != CAM_FMT_NV21) {
+            /* The slot was not written: announcing it would hand producers a stale or
+             * garbage frame. Drop it, logging at most once per second. */
+            static struct timespec last_log[MAX_CAMERAS];
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec != last_log[cam].tv_sec) {
+                last_log[cam] = now;
+                LOGE("cam %d: frame %dx%d does not fit slot (%zu B), dropped",
+                     cam, w, h, g_cam.slot_bytes[cam]);
+            }
+            AImage_delete(image);
+            return;
+        }
 
         int n = 0, sent = 0;
         struct camera_client **snap = snapshot_clients(&n);
@@ -376,10 +396,16 @@ static void cam_start_locked(int id, int width, int height)
 {
     cam_stop_locked(id);   /* tear down any prior pipeline first */
 
-    int w = (width  > 0) ? width  : g_cam.max_w[id];
-    int h = (height > 0) ? height : g_cam.max_h[id];
-    if (w <= 0) w = 1;
-    if (h <= 0) h = 1;
+    /* Never open the full sensor: clamp the request to a size the camera lists and
+     * that fits CAM_CAP_W x CAM_CAP_H (and therefore the shm slot). */
+    struct cam_size sz;
+    if (!cam_size_choose(g_cam.sizes[id], g_cam.num_sizes[id], width, height, &sz)) {
+        LOGE("start: camera %d has no YUV size within %dx%d (requested %dx%d)",
+             id, CAM_CAP_W, CAM_CAP_H, width, height);
+        return;
+    }
+    int w = sz.w;
+    int h = sz.h;
 
     media_status_t ms = AImageReader_newWithUsage(
             w, h, AIMAGE_FORMAT_YUV_420_888,
@@ -852,8 +878,9 @@ Java_com_anland_consumer_CameraServices_nativeDestroyCameraService(
 
 bool camera_service_is_ready(void) { return g_cam.ready; }
 
-/* Discover cameras via the NDK manager and cache each one's max YUV_420_888 output
- * size. Returns the camera count (capped at MAX_CAMERAS). */
+/* Discover cameras via the NDK manager, cache each one's YUV_420_888 output sizes, and
+ * pick the largest within CAM_CAP_W x CAM_CAP_H as its reported max. Returns the
+ * camera count (capped at MAX_CAMERAS). */
 static int discover_cameras(void)
 {
     g_cam.cam_mgr = ACameraManager_create();
@@ -880,7 +907,6 @@ static int discover_cameras(void)
         ACameraMetadata_const_entry entry;
         if (ACameraMetadata_getConstEntry(meta,
                 ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, &entry) == ACAMERA_OK) {
-            long bestArea = 0;
             for (uint32_t k = 0; k + 3 < entry.count; k += 4) {
                 int32_t fmt = entry.data.i32[k];
                 int32_t w   = entry.data.i32[k + 1];
@@ -889,8 +915,15 @@ static int discover_cameras(void)
                 if (fmt != AIMAGE_FORMAT_YUV_420_888 ||
                     io  != ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT)
                     continue;
-                long area = (long)w * h;
-                if (area > bestArea) { bestArea = area; g_cam.max_w[i] = w; g_cam.max_h[i] = h; }
+                if (g_cam.num_sizes[i] < CAM_MAX_SIZES)
+                    g_cam.sizes[i][g_cam.num_sizes[i]++] = (struct cam_size){ w, h };
+            }
+            /* Report (and size the shm slots for) the largest size within the cap,
+             * not the sensor maximum. */
+            struct cam_size max;
+            if (cam_size_capped_max(g_cam.sizes[i], g_cam.num_sizes[i], &max)) {
+                g_cam.max_w[i] = max.w;
+                g_cam.max_h[i] = max.h;
             }
         }
         ACameraMetadata_free(meta);
@@ -928,7 +961,7 @@ int camera_service_init(void)
     g_cam.num_cameras = discover_cameras();
     LOGI("init: %d camera(s)", g_cam.num_cameras);
 
-    /* One shared frame buffer per camera, sized for its max resolution. */
+    /* One shared frame buffer per camera, sized for its capped max resolution. */
     for (int i = 0; i < g_cam.num_cameras; i++)
         if (cam_shm_create(i) < 0)
             LOGE("init: shared shm for cam %d failed", i);

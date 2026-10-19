@@ -34,7 +34,8 @@
  *
  * Frame transport (shared memory, zero socket copy):
  *   Each camera owns one ashmem region of CAMERA_SLOTS * slot_bytes, created once at
- *   init and sized for the camera's max resolution (slot_bytes = maxW*maxH*3/2) and
+ *   init and sized for the camera's max resolution within CAM_CAP_W x CAM_CAP_H
+ *   (camera_size.h; slot_bytes = maxW*maxH*3/2) and
  *   SHARED by all recorders. The AImageReader callback packs each frame as NV21 straight
  *   into a slot, then notifies every recorder over its stream_fd. The two ends ping-pong
  *   the two slots:
