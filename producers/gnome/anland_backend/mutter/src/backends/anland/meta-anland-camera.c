@@ -108,9 +108,9 @@ struct cam {
     /* Current negotiated node format. The node always advertises exactly this, and we
      * re-negotiate it to match the resolution + pixel layout the consumer actually sends. */
     uint32_t              fmt_w, fmt_h;
-    int                   fmt_code;   /* CAM_FMT_* of cam->frame (always NV12) */
-    /* Pixel format the linked app negotiated (SPA_VIDEO_FORMAT_YUY2 or _NV12); frames
-     * are converted from cam->frame into it while filling the app's buffer. */
+    int                   fmt_code;   /* CAM_FMT_* the node renegotiates with (NV12) */
+    /* Pixel format the linked app negotiated (SPA_VIDEO_FORMAT_YUY2 or _NV12). Each
+     * camera frame is converted into it once, when it arrives. */
     uint32_t              out_fmt;
 
     /* Hot-swapped per (re)connect. -1 while detached -> the node emits blank frames. */
@@ -126,11 +126,17 @@ struct cam {
     size_t                slot_bytes;
     bool                  shm_requested;
 
-    /* Producer-owned copy of the latest frame (loop thread only). */
+    /* Producer-owned copy of the latest frame, already in frame_fmt (loop thread
+     * only). on_process hands it to the app once (frame_new), not on every graph
+     * cycle: the node follows the always-running audio driver (~47 Hz), and copying
+     * a 1080p frame on each cycle kept a core busy. */
     uint8_t              *frame;
     size_t                frame_cap;
     size_t                frame_size;
+    uint32_t              frame_fmt, frame_w, frame_h;
     bool                  have_frame;
+    bool                  frame_new;
+    int64_t               last_blank_us;   /* last gray frame, while not live */
 };
 
 struct anland_camera {
@@ -166,7 +172,6 @@ static void renegotiate_format(struct cam *cam, uint32_t w, uint32_t h,
                                int fmt_code);
 #define CAM_N_OUT_FMTS 2
 static size_t yuy2_frame_size(uint32_t w, uint32_t h);
-static void nv12_to_yuy2(uint8_t *dst, const uint8_t *nv12, uint32_t w, uint32_t h);
 static uint32_t build_video_formats(struct spa_pod_builder *b, uint32_t w, uint32_t h,
                                     const struct spa_pod **params);
 
@@ -421,14 +426,29 @@ static void update_recording(struct cam *cam)
 
 /* ---- frame emission ---- */
 
-/* The graph calls this whenever the consuming app needs a frame. Emit the latest
- * received frame, or neutral gray while detached / before the first frame arrives, so
- * a consuming app always gets a feed. Runs on the loop thread, same as the stream-
- * socket reader, so cam->frame needs no lock. */
+/* Gray frames while detached / before the first frame: enough to keep an app's
+ * pipeline alive and show something, at a fraction of the graph rate. */
+#define CAM_BLANK_INTERVAL_US (100 * 1000)
+
+/* The graph calls this on every cycle of the driver it follows. Emit each received
+ * frame once, or neutral gray (rate-limited) while detached / before the first frame
+ * arrives, so a consuming app always gets a feed. Runs on the loop thread, same as the
+ * stream-socket reader, so cam->frame needs no lock. */
 static void on_process(void *data)
 {
     struct cam *cam = data;
     if (!cam->node)
+        return;
+
+    const bool yuy2 = cam->out_fmt == SPA_VIDEO_FORMAT_YUY2;
+    const bool live = cam->have_frame && cam->stream_fd >= 0 &&
+                      cam->frame_fmt == cam->out_fmt &&
+                      cam->frame_w == cam->fmt_w && cam->frame_h == cam->fmt_h;
+    const int64_t now = g_get_monotonic_time();
+
+    if (live && !cam->frame_new)
+        return;   /* no new camera frame since the last one: the app keeps it */
+    if (!live && now - cam->last_blank_us < CAM_BLANK_INTERVAL_US)
         return;
 
     struct pw_buffer *pwb = pw_stream_dequeue_buffer(cam->node);
@@ -439,27 +459,23 @@ static void on_process(void *data)
         return;
     struct spa_data *d = &pwb->buffer->datas[0];
     if (d->data && d->chunk) {
-        const bool yuy2 = cam->out_fmt == SPA_VIDEO_FORMAT_YUY2;
-        size_t nv12_bytes = 0, out_bytes;
-        bool live = cam->have_frame && cam->stream_fd >= 0;
+        size_t out_bytes = 0;
 
-        if (!camera_frame_size(cam->fmt_w, cam->fmt_h, &nv12_bytes)) {
-            pw_stream_queue_buffer(cam->node, pwb);
-            return;
-        }
-        out_bytes = yuy2 ? yuy2_frame_size(cam->fmt_w, cam->fmt_h) : nv12_bytes;
-        if (live && cam->frame_size != nv12_bytes)
-            live = false;   /* a frame of the previous size: renegotiating */
+        if (yuy2)
+            out_bytes = yuy2_frame_size(cam->fmt_w, cam->fmt_h);
+        else if (!camera_frame_size(cam->fmt_w, cam->fmt_h, &out_bytes))
+            out_bytes = SIZE_MAX;
         if (out_bytes > d->maxsize) {
             pw_stream_queue_buffer(cam->node, pwb);
             return;         /* buffers of the previous format: wait for the new pool */
         }
-        if (!live)
-            memset(d->data, 128, out_bytes);   /* neutral gray, in NV12 and YUY2 alike */
-        else if (yuy2)
-            nv12_to_yuy2(d->data, cam->frame, cam->fmt_w, cam->fmt_h);
-        else
+        if (live) {
             memcpy(d->data, cam->frame, out_bytes);
+            cam->frame_new = false;
+        } else {
+            memset(d->data, 128, out_bytes);   /* neutral gray, in NV12 and YUY2 alike */
+            cam->last_blank_us = now;
+        }
         d->chunk->offset = 0;
         d->chunk->stride = yuy2 ? (int32_t)cam->fmt_w * 2 : (int32_t)cam->fmt_w;
         d->chunk->size = (uint32_t)out_bytes;
@@ -545,24 +561,48 @@ static size_t yuy2_frame_size(uint32_t w, uint32_t h)
     return (size_t)w * h * 2;
 }
 
-/* NV12 (w*h Y, then w*h/2 interleaved UV) -> YUY2 (Y0 U Y1 V per pixel pair), each
- * chroma row serving two output rows. OBS reads NV12 from shared memory with a wrong
- * row size (its format table gives NV12 2 bytes per pixel) and crashes copying the
- * first frame; YUY2 really is 2 bytes per pixel, so OBS handles it. */
-static void nv12_to_yuy2(uint8_t *dst, const uint8_t *nv12, uint32_t w, uint32_t h)
+/* Copy one consumer frame (NV21, NV12 or I420; Y stride w) into dst as YUY2 (Y0 U Y1 V
+ * per pixel pair), each chroma row serving two output rows. OBS reads NV12 from shared
+ * memory with a wrong row size (its format table gives NV12 2 bytes per pixel) and
+ * crashes copying the first frame; YUY2 really is 2 bytes per pixel, so OBS handles it. */
+static void copy_frame_as_yuy2(uint8_t *dst, const uint8_t *src, uint32_t w, uint32_t h,
+                               int fmt)
 {
-    const uint8_t *uv_plane = nv12 + (size_t)w * h;
+    const uint8_t *chroma = src + (size_t)w * h;
+    const uint8_t *u, *v;
+    size_t c_stride, c_step;
+
+    switch (fmt) {
+    case CAM_FMT_NV21:
+        v = chroma;
+        u = chroma + 1;
+        c_stride = w;
+        c_step = 2;
+        break;
+    case CAM_FMT_I420:
+        u = chroma;
+        v = chroma + (size_t)(w / 2) * (h / 2);
+        c_stride = w / 2;
+        c_step = 1;
+        break;
+    default:   /* CAM_FMT_NV12 */
+        u = chroma;
+        v = chroma + 1;
+        c_stride = w;
+        c_step = 2;
+        break;
+    }
 
     for (uint32_t y = 0; y < h; y++) {
-        const uint8_t *row = nv12 + (size_t)y * w;
-        const uint8_t *uv = uv_plane + (size_t)(y / 2) * w;
+        const uint8_t *row = src + (size_t)y * w;
+        const uint8_t *ur = u + (size_t)(y / 2) * c_stride;
+        const uint8_t *vr = v + (size_t)(y / 2) * c_stride;
         uint8_t *out = dst + (size_t)y * w * 2;
 
-        for (uint32_t x = 0; x + 1 < w; x += 2) {
-            out[0] = row[x];
-            out[1] = uv[x];
-            out[2] = row[x + 1];
-            out[3] = uv[x + 1];
+        for (uint32_t x = 0, i = 0; x + 1 < w; x += 2, i += c_step) {
+            const uint32_t px = (uint32_t)row[x] | (uint32_t)ur[i] << 8 |
+                                (uint32_t)row[x + 1] << 16 | (uint32_t)vr[i] << 24;
+            memcpy(out, &px, sizeof(px));   /* little-endian: Y0 U Y1 V */
             out += 4;
         }
     }
@@ -613,19 +653,30 @@ static void handle_stream_msg(struct cam *cam, const struct cam_stream_msg *m, i
                      camera_frame_size(w, h, &bytes);
         if (cam->shm && slot < CAMERA_SLOTS && valid &&
             bytes <= cam->slot_bytes) {
-            if (cam->frame_cap < bytes) {
-                uint8_t *nb = realloc(cam->frame, bytes);
+            const bool yuy2 = cam->out_fmt == SPA_VIDEO_FORMAT_YUY2;
+            const size_t out_bytes = yuy2 ? yuy2_frame_size(w, h) : bytes;
+            const uint8_t *slot_data = cam->shm + (size_t)slot * cam->slot_bytes;
+
+            if (cam->frame_cap < out_bytes) {
+                uint8_t *nb = realloc(cam->frame, out_bytes);
                 if (nb) {
                     cam->frame = nb;
-                    cam->frame_cap = bytes;
+                    cam->frame_cap = out_bytes;
                 }
             }
-            if (cam->frame_cap >= bytes && bytes > 0) {
-                /* Copy out of the slot promptly so the consumer can reuse it. */
-                copy_frame_as_nv12(cam->frame, cam->shm + (size_t)slot * cam->slot_bytes,
-                                   w, h, fmt);
-                cam->frame_size = bytes;
+            if (cam->frame_cap >= out_bytes && out_bytes > 0) {
+                /* Copy out of the slot promptly so the consumer can reuse it, converting
+                 * once into the format the app negotiated. */
+                if (yuy2)
+                    copy_frame_as_yuy2(cam->frame, slot_data, w, h, fmt);
+                else
+                    copy_frame_as_nv12(cam->frame, slot_data, w, h, fmt);
+                cam->frame_size = out_bytes;
+                cam->frame_fmt = cam->out_fmt;
+                cam->frame_w = w;
+                cam->frame_h = h;
                 cam->have_frame = true;
+                cam->frame_new = true;
             }
         }
         /* Release the slot (even if we couldn't read, so the consumer never wedges). */
