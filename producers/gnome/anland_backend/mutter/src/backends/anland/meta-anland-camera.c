@@ -108,7 +108,10 @@ struct cam {
     /* Current negotiated node format. The node always advertises exactly this, and we
      * re-negotiate it to match the resolution + pixel layout the consumer actually sends. */
     uint32_t              fmt_w, fmt_h;
-    int                   fmt_code;   /* CAM_FMT_* currently announced */
+    int                   fmt_code;   /* CAM_FMT_* of cam->frame (always NV12) */
+    /* Pixel format the linked app negotiated (SPA_VIDEO_FORMAT_YUY2 or _NV12); frames
+     * are converted from cam->frame into it while filling the app's buffer. */
+    uint32_t              out_fmt;
 
     /* Hot-swapped per (re)connect. -1 while detached -> the node emits blank frames. */
     int                   stream_fd;
@@ -161,8 +164,11 @@ static void detach_fd(struct cam *cam);
 static void clear_resources_locked(struct anland_camera *c);
 static void renegotiate_format(struct cam *cam, uint32_t w, uint32_t h,
                                int fmt_code);
-static const struct spa_pod *build_video_format(struct spa_pod_builder *b,
-                                                uint32_t w, uint32_t h, int fmt_code);
+#define CAM_N_OUT_FMTS 2
+static size_t yuy2_frame_size(uint32_t w, uint32_t h);
+static void nv12_to_yuy2(uint8_t *dst, const uint8_t *nv12, uint32_t w, uint32_t h);
+static uint32_t build_video_formats(struct spa_pod_builder *b, uint32_t w, uint32_t h,
+                                    const struct spa_pod **params);
 
 static bool camera_frame_size(uint32_t width, uint32_t height, size_t *size)
 {
@@ -433,24 +439,30 @@ static void on_process(void *data)
         return;
     struct spa_data *d = &pwb->buffer->datas[0];
     if (d->data && d->chunk) {
-        const bool live = cam->have_frame && cam->stream_fd >= 0;
-        size_t fmt_bytes = 0;
-        size_t avail;
-        uint32_t copy;
+        const bool yuy2 = cam->out_fmt == SPA_VIDEO_FORMAT_YUY2;
+        size_t nv12_bytes = 0, out_bytes;
+        bool live = cam->have_frame && cam->stream_fd >= 0;
 
-        if (!camera_frame_size(cam->fmt_w, cam->fmt_h, &fmt_bytes)) {
+        if (!camera_frame_size(cam->fmt_w, cam->fmt_h, &nv12_bytes)) {
             pw_stream_queue_buffer(cam->node, pwb);
             return;
         }
-        avail = live ? cam->frame_size : fmt_bytes;
-        copy = avail < d->maxsize ? (uint32_t)avail : d->maxsize;
-        if (live)
-            memcpy(d->data, cam->frame, copy);
+        out_bytes = yuy2 ? yuy2_frame_size(cam->fmt_w, cam->fmt_h) : nv12_bytes;
+        if (live && cam->frame_size != nv12_bytes)
+            live = false;   /* a frame of the previous size: renegotiating */
+        if (out_bytes > d->maxsize) {
+            pw_stream_queue_buffer(cam->node, pwb);
+            return;         /* buffers of the previous format: wait for the new pool */
+        }
+        if (!live)
+            memset(d->data, 128, out_bytes);   /* neutral gray, in NV12 and YUY2 alike */
+        else if (yuy2)
+            nv12_to_yuy2(d->data, cam->frame, cam->fmt_w, cam->fmt_h);
         else
-            memset(d->data, 128, copy);   /* neutral gray: valid I420 at any size */
+            memcpy(d->data, cam->frame, out_bytes);
         d->chunk->offset = 0;
-        d->chunk->stride = cam->fmt_w;   /* I420 Y-plane stride */
-        d->chunk->size = copy;
+        d->chunk->stride = yuy2 ? (int32_t)cam->fmt_w * 2 : (int32_t)cam->fmt_w;
+        d->chunk->size = (uint32_t)out_bytes;
     }
     pw_stream_queue_buffer(cam->node, pwb);
 }
@@ -474,8 +486,8 @@ static void renegotiate_format(struct cam *cam, uint32_t w, uint32_t h, int fmt_
     cam->fmt_code = fmt_code;
     uint8_t buffer[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-    const struct spa_pod *params[1] = { build_video_format(&b, w, h, fmt_code) };
-    pw_stream_update_params(cam->node, params, 1);
+    const struct spa_pod *params[CAM_N_OUT_FMTS];
+    pw_stream_update_params(cam->node, params, build_video_formats(&b, w, h, params));
 }
 
 /* ---- stream socket: shm hand-off + READY/DONE pacing ---- */
@@ -525,6 +537,34 @@ static void copy_frame_as_nv12(uint8_t *dst, const uint8_t *src, uint32_t w, uin
     default:   /* CAM_FMT_NV12 */
         memcpy(dst, src, c_size);
         break;
+    }
+}
+
+static size_t yuy2_frame_size(uint32_t w, uint32_t h)
+{
+    return (size_t)w * h * 2;
+}
+
+/* NV12 (w*h Y, then w*h/2 interleaved UV) -> YUY2 (Y0 U Y1 V per pixel pair), each
+ * chroma row serving two output rows. OBS reads NV12 from shared memory with a wrong
+ * row size (its format table gives NV12 2 bytes per pixel) and crashes copying the
+ * first frame; YUY2 really is 2 bytes per pixel, so OBS handles it. */
+static void nv12_to_yuy2(uint8_t *dst, const uint8_t *nv12, uint32_t w, uint32_t h)
+{
+    const uint8_t *uv_plane = nv12 + (size_t)w * h;
+
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t *row = nv12 + (size_t)y * w;
+        const uint8_t *uv = uv_plane + (size_t)(y / 2) * w;
+        uint8_t *out = dst + (size_t)y * w * 2;
+
+        for (uint32_t x = 0; x + 1 < w; x += 2) {
+            out[0] = row[x];
+            out[1] = uv[x];
+            out[2] = row[x + 1];
+            out[3] = uv[x + 1];
+            out += 4;
+        }
     }
 }
 
@@ -672,24 +712,26 @@ static void detach_fd(struct cam *cam)
 
 /* ---- Video/Source node ---- */
 
-static uint32_t spa_video_fmt(int code)
+/* The formats an app may pick, as separate EnumFormat params (OBS reads one plain
+ * format per param). YUY2 first: an app that leaves the choice to PipeWire (OBS by
+ * default) gets the first, and OBS crashes on NV12 (see nv12_to_yuy2). libwebrtc
+ * (Zen, Chromium) maps both. Returns the number of params written. */
+static uint32_t build_video_formats(struct spa_pod_builder *b, uint32_t w, uint32_t h,
+                                    const struct spa_pod **params)
 {
-    switch (code) {
-    case CAM_FMT_NV12: return SPA_VIDEO_FORMAT_NV12;
-    case CAM_FMT_NV21: return SPA_VIDEO_FORMAT_NV21;
-    default:           return SPA_VIDEO_FORMAT_I420;
-    }
-}
+    static const uint32_t formats[CAM_N_OUT_FMTS] = {
+        SPA_VIDEO_FORMAT_YUY2, SPA_VIDEO_FORMAT_NV12,
+    };
 
-static const struct spa_pod *build_video_format(struct spa_pod_builder *b,
-                                                uint32_t w, uint32_t h, int fmt_code)
-{
-    struct spa_video_info_raw info;
-    spa_zero(info);
-    info.format = spa_video_fmt(fmt_code);
-    info.size = SPA_RECTANGLE(w, h);
-    info.framerate = SPA_FRACTION(CAM_FPS, 1);
-    return spa_format_video_raw_build(b, SPA_PARAM_EnumFormat, &info);
+    for (uint32_t i = 0; i < CAM_N_OUT_FMTS; i++) {
+        struct spa_video_info_raw info;
+        spa_zero(info);
+        info.format = formats[i];
+        info.size = SPA_RECTANGLE(w, h);
+        info.framerate = SPA_FRACTION(CAM_FPS, 1);
+        params[i] = spa_format_video_raw_build(b, SPA_PARAM_EnumFormat, &info);
+    }
+    return CAM_N_OUT_FMTS;
 }
 
 static void on_stream_state_changed(void *data, enum pw_stream_state old,
@@ -778,10 +820,21 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
         cam->fmt_w = raw.size.width;
     if (raw.size.height)
         cam->fmt_h = raw.size.height;
+    cam->out_fmt = raw.format == SPA_VIDEO_FORMAT_YUY2 ? SPA_VIDEO_FORMAT_YUY2
+                                                       : SPA_VIDEO_FORMAT_NV12;
+    g_message("anland-camera: camera %d sends %s %ux%u", cam->index,
+              cam->out_fmt == SPA_VIDEO_FORMAT_YUY2 ? "YUY2" : "NV12",
+              cam->fmt_w, cam->fmt_h);
 
     size_t frame_size;
-    if (!camera_frame_size(cam->fmt_w, cam->fmt_h, &frame_size) ||
-        frame_size > INT32_MAX)
+    if (!camera_frame_size(cam->fmt_w, cam->fmt_h, &frame_size))
+        return;
+    uint32_t stride = cam->fmt_w;
+    if (cam->out_fmt == SPA_VIDEO_FORMAT_YUY2) {
+        frame_size = yuy2_frame_size(cam->fmt_w, cam->fmt_h);
+        stride = cam->fmt_w * 2;
+    }
+    if (frame_size > INT32_MAX)
         return;
 
     uint8_t buffer[512];
@@ -792,7 +845,7 @@ static void on_param_changed(void *data, uint32_t id, const struct spa_pod *para
         SPA_PARAM_BUFFERS_buffers,  SPA_POD_CHOICE_RANGE_Int(4, 2, 8),
         SPA_PARAM_BUFFERS_blocks,   SPA_POD_Int(1),
         SPA_PARAM_BUFFERS_size,     SPA_POD_Int((int)frame_size),
-        SPA_PARAM_BUFFERS_stride,   SPA_POD_Int((int)cam->fmt_w),
+        SPA_PARAM_BUFFERS_stride,   SPA_POD_Int((int)stride),
         SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(
             (1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd)));
     pw_stream_update_params(cam->node, params, 1);
@@ -827,14 +880,14 @@ static int connect_node(struct cam *cam)
 
     uint8_t buffer[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-    const struct spa_pod *params[1] = {
-        build_video_format(&b, cam->fmt_w, cam->fmt_h, cam->fmt_code) };
+    const struct spa_pod *params[CAM_N_OUT_FMTS];
+    uint32_t n_params = build_video_formats(&b, cam->fmt_w, cam->fmt_h, params);
 
     /* No DRIVER flag: the consuming app (graph) drives, so PipeWire calls on_process
      * on demand. No RT_PROCESS either, so on_process runs on the same loop thread as
      * the stream-socket reader and shares cam->frame without a lock. */
     int ret = pw_stream_connect(cam->node, PW_DIRECTION_OUTPUT, PW_ID_ANY,
-                                PW_STREAM_FLAG_MAP_BUFFERS, params, 1);
+                                PW_STREAM_FLAG_MAP_BUFFERS, params, n_params);
     if (ret < 0) {
         spa_hook_remove(&cam->listener);
         pw_stream_destroy(cam->node);
@@ -857,9 +910,11 @@ static int create_node(struct cam *cam)
         cam->fmt_w = CAM_DEF_W;
         cam->fmt_h = CAM_DEF_H;
     }
-    /* Advertise NV12 from the start (frames are converted on copy) -- no live format
-     * switch (which crashes downstream gst). Only resolution ever renegotiates. */
+    /* Frames are kept as NV12 (converted on copy) and offered as YUY2 or NV12 -- no
+     * live format switch (which crashes downstream gst). Only resolution ever
+     * renegotiates. */
     cam->fmt_code = CAM_FMT_NV12;
+    cam->out_fmt = SPA_VIDEO_FORMAT_NV12;
     return connect_node(cam);
 }
 
