@@ -91,6 +91,8 @@ public class MainActivity extends Activity
     });
     // Media audio focus for this window (volume keys + playback priority).
     private AudioManager mAudioManager;
+    // Routes the forwarded mic to a Bluetooth headset while a desktop app records.
+    private MicRouter mMicRouter;
     private AudioFocusRequest mAudioFocusRequest;
     // Socket path from the launch Intent; overrides the saved pref when non-null.
     private String mSocketOverride = null;
@@ -542,6 +544,8 @@ public class MainActivity extends Activity
 
         // Each window owns its own native pipeline.
         mNative = new Native();
+        mMicRouter = new MicRouter(getSystemService(AudioManager.class), mNative);
+        mNative.setMicRouter(mMicRouter);
         setTaskDescription(new ActivityManager.TaskDescription(mWindowName));
 
         clipboard = new Clipboard(this, mNative);
@@ -1672,6 +1676,11 @@ public class MainActivity extends Activity
         if (mNative != null) {
             mNative.destroy();
             mNative = null;
+        }
+        // After the bridge stopped: it releases the headset itself on the way out.
+        if (mMicRouter != null) {
+            mMicRouter.release();
+            mMicRouter = null;
         }
         cameraInited = false;
         super.onDestroy();

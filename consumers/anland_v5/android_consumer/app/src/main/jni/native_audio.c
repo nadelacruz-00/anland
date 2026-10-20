@@ -25,6 +25,7 @@
  * it, telling the producer so PipeWire matches. See protocol.h. */
 #define WANT_PLAY_CHANNELS 2
 #define WANT_CAP_CHANNELS  1
+#define MAX_CAP_CHANNELS   2
 #define MAX_DGRAM          (64 * 1024)
 #define MIC_MAX_FRAMES     1024   /* upper bound on frames per mic read */
 #define PLAY_POLL_MS       100
@@ -38,6 +39,12 @@
  * long so the audio path can idle instead of holding the codec/HAL on forever
  * (idle power). A fresh PCM datagram restarts it via ensure_play_stream_started(). */
 #define PLAY_IDLE_STOP_MS  1500
+#define CAP_RETRY_MS       500   /* wait before retrying a mic stream that failed to open */
+/* After connecting, give the producer this long to report capture state before
+ * assuming an older one that never will (and recording whenever the mic is on).
+ * A current producer reports at once; opening the mic in between would briefly put
+ * a Bluetooth headset into call mode on every connect. */
+#define CAP_GATE_WAIT_MS   1000
 
 struct audio_bridge {
     volatile bool running;
@@ -69,6 +76,17 @@ struct audio_bridge {
      * power. Off (default): the play thread idle-stops the stream after silence
      * so the audio path can sleep. */
     volatile bool keepalive_enabled;
+
+    /* Capture gating from the producer (AUDIO_MSG_CAPTURE_STATE). Written by the
+     * playback thread, which owns socket reads; read by the capture thread. Without
+     * any such message on a connection (an older producer) the mic records whenever
+     * mic_enabled, as before. */
+    volatile bool capture_gated;    /* the producer reports capture state */
+    volatile bool capture_active;   /* a desktop app records from the virtual mic */
+    volatile bool mic_reroute;      /* preferred input changed: reopen b->rec */
+    volatile uint64_t connected_ms; /* when the playback thread saw the current fd */
+    audio_mic_route_fn mic_route;   /* Java headset router; see audio_set_mic_router() */
+    void *mic_route_data;
 
     /*
      * Playback is pull-driven by an AAudio data callback. The socket thread only
@@ -324,7 +342,8 @@ static void play_error_cb(AAudioStream *stream, void *userdata, aaudio_result_t 
 /* ---- AAudio stream helpers ---- */
 
 static AAudioStream *open_stream(struct audio_bridge *bridge,
-                                 aaudio_direction_t dir, int channels)
+                                 aaudio_direction_t dir, int channels,
+                                 int32_t device_id)
 {
     AAudioStreamBuilder *bld = NULL;
     if (AAudio_createStreamBuilder(&bld) != AAUDIO_OK || !bld)
@@ -343,6 +362,15 @@ static AAudioStream *open_stream(struct audio_bridge *bridge,
         AAudioStreamBuilder_setPerformanceMode(bld, AAUDIO_PERFORMANCE_MODE_NONE);
         AAudioStreamBuilder_setDataCallback(bld, play_data_cb, bridge);
         AAudioStreamBuilder_setErrorCallback(bld, play_error_cb, bridge);
+    } else if (device_id > 0) {
+        /* A routed headset is a call device: VOICE_COMMUNICATION lets Android run its
+         * echo/noise processing for it. Ask for the rate the producer already knows;
+         * a shared stream resamples, so its PipeWire source needs no renegotiation
+         * (SCO and LE Audio mics run at 16/32 kHz). */
+        AAudioStreamBuilder_setDeviceId(bld, device_id);
+        AAudioStreamBuilder_setSampleRate(bld, bridge->cap_rate > 0 ? bridge->cap_rate : 48000);
+        AAudioStreamBuilder_setInputPreset(bld, AAUDIO_INPUT_PRESET_VOICE_COMMUNICATION);
+        AAudioStreamBuilder_setPerformanceMode(bld, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
     } else {
         AAudioStreamBuilder_setInputPreset(bld, AAUDIO_INPUT_PRESET_VOICE_RECOGNITION);
         AAudioStreamBuilder_setPerformanceMode(bld, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
@@ -387,7 +415,7 @@ static bool open_play_stream(struct audio_bridge *b, bool reset_ring)
     if (b->play_channels <= 0)
         b->play_channels = WANT_PLAY_CHANNELS;
 
-    b->play = open_stream(b, AAUDIO_DIRECTION_OUTPUT, WANT_PLAY_CHANNELS);
+    b->play = open_stream(b, AAUDIO_DIRECTION_OUTPUT, WANT_PLAY_CHANNELS, 0);
     if (!b->play)
         return false;
 
@@ -536,6 +564,10 @@ static void *play_thread_func(void *arg)
             pthread_mutex_unlock(&b->play_lock);
             had_fd = false;
             last_fd = fd;
+            /* A new producer may not report capture state; see CAP_GATE_WAIT_MS. */
+            b->capture_gated = false;
+            b->capture_active = false;
+            b->connected_ms = now_ms();
         }
 
         if (fd < 0) {
@@ -581,8 +613,18 @@ static void *play_thread_func(void *arg)
 
         struct audio_msg h;
         memcpy(&h, b->rx, sizeof(h));
+        if (h.type == AUDIO_MSG_CAPTURE_STATE) {
+            uint32_t active;
+            if (h.size != sizeof(active) || (size_t)n < sizeof(h) + sizeof(active))
+                continue;
+            memcpy(&active, b->rx + sizeof(h), sizeof(active));
+            b->capture_active = active != 0;
+            b->capture_gated = true;
+            LOGI("desktop mic %s", active ? "in use" : "idle");
+            continue;
+        }
         if (h.type != AUDIO_MSG_PCM)
-            continue;   /* the producer only sends PCM back; formats flow upstream */
+            continue;   /* formats flow upstream only */
 
         size_t avail = (size_t)n - sizeof(struct audio_msg);
         size_t bytes = h.size < avail ? h.size : avail;
@@ -606,51 +648,146 @@ static void *play_thread_func(void *arg)
 
 /* ---- capture: mic -> socket ---- */
 
+/* b->rec is only ever opened, read and closed on the capture thread (and by
+ * audio_stop() after joining it), so none of these need a lock. */
+static void close_rec(struct audio_bridge *b)
+{
+    if (!b->rec)
+        return;
+    AAudioStream_requestStop(b->rec);
+    AAudioStream_close(b->rec);
+    b->rec = NULL;
+}
+
+/* Adopt the opened stream's real format; if it differs from what the producer was
+ * told, the playback thread re-announces it so the PipeWire source matches. */
+static void adopt_cap_format(struct audio_bridge *b)
+{
+    int rate = AAudioStream_getSampleRate(b->rec);
+    int channels = AAudioStream_getChannelCount(b->rec);
+
+    if (rate <= 0 || channels <= 0 || channels > MAX_CAP_CHANNELS)
+        return;
+    if (rate == b->cap_rate && channels == b->cap_channels)
+        return;
+    b->cap_rate = rate;
+    b->cap_channels = channels;
+    b->resend_formats = true;
+    LOGI("capture format now %d Hz x%d", rate, channels);
+}
+
+/* Open and start b->rec. When the producer reports capture state, the router is
+ * asked first and may hand back a headset input (*routed records that it was asked,
+ * so the caller releases it again). Falls back to the default input. */
+static bool open_rec(struct audio_bridge *b, bool *routed)
+{
+    int32_t device = 0;
+
+    close_rec(b);
+    b->mic_reroute = false;
+    if (b->capture_gated && b->mic_route) {
+        device = b->mic_route(b->mic_route_data, 1);
+        *routed = true;
+    }
+    if (device > 0) {
+        b->rec = open_stream(b, AAUDIO_DIRECTION_INPUT, WANT_CAP_CHANNELS, device);
+        if (!b->rec) {
+            LOGE("mic: headset routing failed: cannot open input %d, using the default mic",
+                 device);
+            b->mic_route(b->mic_route_data, 0);
+            *routed = false;
+        }
+    }
+    if (!b->rec)
+        b->rec = open_stream(b, AAUDIO_DIRECTION_INPUT, WANT_CAP_CHANNELS, 0);
+    if (!b->rec)
+        return false;   /* RECORD_AUDIO not granted, or no input right now */
+
+    adopt_cap_format(b);
+    aaudio_result_t r = AAudioStream_requestStart(b->rec);
+    if (r != AAUDIO_OK) {
+        LOGE("start input stream failed: %s", AAudio_convertResultToText(r));
+        close_rec(b);
+        return false;
+    }
+    LOGI("mic capture started on device %d (%d Hz x%d)",
+         AAudioStream_getDeviceId(b->rec), b->cap_rate, b->cap_channels);
+    return true;
+}
+
 static void *cap_thread_func(void *arg)
 {
     struct audio_bridge *b = arg;
     LOGI("capture thread started");
 
-    bool started = false;
-    int cap_channels = b->cap_channels > 0 ? b->cap_channels : WANT_CAP_CHANNELS;
-    int16_t *buf = malloc((size_t)MIC_MAX_FRAMES * (size_t)cap_channels * sizeof(*buf));
+    bool routed = false;        /* the router was asked for a device and not released */
+    bool rec_gated = false;     /* capture_gated when b->rec was opened */
+    uint64_t retry_at_ms = 0;   /* back-off after a stream failed to open */
+    int16_t *buf = malloc((size_t)MIC_MAX_FRAMES * MAX_CAP_CHANNELS * sizeof(*buf));
     if (!buf) {
         LOGE("allocate capture buffer failed");
         return NULL;
     }
-    /* ~10 ms per read at the device rate, capped to the buffer. */
-    int32_t mic_frames = b->cap_rate / 100;
-    if (mic_frames <= 0)
-        mic_frames = 1;
-    if (mic_frames > MIC_MAX_FRAMES)
-        mic_frames = MIC_MAX_FRAMES;
 
     while (b->running) {
         int fd = current_fd(b);
-        if (!b->mic_enabled || fd < 0) {
-            if (started && b->rec) {
-                AAudioStream_requestStop(b->rec);
-                started = false;
+        /* With a producer that reports capture state, record only while a desktop
+         * app does: an open mic keeps Android's mic indicator on and holds a
+         * Bluetooth headset in its low-quality call mode. */
+        bool gated = b->capture_gated;
+        bool want = b->mic_enabled && fd >= 0
+                    && (gated ? b->capture_active
+                              : now_ms() - b->connected_ms >= CAP_GATE_WAIT_MS);
+        if (!want) {
+            if (b->rec) {
+                close_rec(b);
+                LOGI("mic capture stopped");
             }
+            if (routed) {
+                b->mic_route(b->mic_route_data, 0);
+                routed = false;
+            }
+            retry_at_ms = 0;
             usleep(20000);
             continue;
         }
-        if (!b->rec) {
-            usleep(20000);
-            continue;
-        }
-        if (!started) {
-            if (AAudioStream_requestStart(b->rec) != AAUDIO_OK) {
-                usleep(50000);
+        /* Reopen when asked to, and when the producer started reporting state while
+         * the stream was open the old way, so it goes through the router. */
+        if (!b->rec || b->mic_reroute || rec_gated != gated) {
+            if (now_ms() < retry_at_ms) {
+                usleep(20000);
                 continue;
             }
-            started = true;
+            rec_gated = gated;
+            if (!open_rec(b, &routed)) {
+                retry_at_ms = now_ms() + CAP_RETRY_MS;
+                continue;
+            }
         }
+
+        int cap_channels = b->cap_channels > 0 ? b->cap_channels : WANT_CAP_CHANNELS;
+        /* ~10 ms per read at the device rate, capped to the buffer. */
+        int32_t mic_frames = b->cap_rate / 100;
+        if (mic_frames <= 0)
+            mic_frames = 1;
+        if (mic_frames > MIC_MAX_FRAMES)
+            mic_frames = MIC_MAX_FRAMES;
 
         TracyCZoneN(zMicRead, "mic read", 1);
         int32_t got = AAudioStream_read(b->rec, buf, mic_frames, 100 * 1000 * 1000L);
         TracyCZoneEnd(zMicRead);
-        if (got <= 0)
+        if (got < 0) {
+            /* The input went away (headset unplugged or turned off): reopen through
+             * the router, which falls back to the built-in mic. */
+            if (got == AAUDIO_ERROR_DISCONNECTED) {
+                LOGI("mic: input disconnected, reopening");
+                b->mic_reroute = true;
+            } else {
+                usleep(10000);
+            }
+            continue;
+        }
+        if (got == 0)
             continue;
 
         uint32_t bytes = (uint32_t)got * sizeof(int16_t) * (uint32_t)cap_channels;
@@ -666,8 +803,9 @@ static void *cap_thread_func(void *arg)
         TracyCFrameMark;
     }
 
-    if (started && b->rec)
-        AAudioStream_requestStop(b->rec);
+    close_rec(b);
+    if (routed)
+        b->mic_route(b->mic_route_data, 0);
     free(buf);
     LOGI("capture thread stopped");
     return NULL;
@@ -707,15 +845,15 @@ void audio_start(audio_bridge *b)
     b->play_error = false;
     open_play_stream(b, true);
 
-    /* Open the input stream even before the mic is enabled; it is started/stopped
-     * by the capture thread. May be NULL if RECORD_AUDIO is not granted. */
+    /* The input stream is opened by the capture thread only while it records (not
+     * here, not even to probe: an open input can already take a Bluetooth headset
+     * out of its high-quality mode). Announce the usual format; the capture thread
+     * re-announces if the device picks another. */
     b->cap_rate = 48000;
     b->cap_channels = WANT_CAP_CHANNELS;
-    b->rec = open_stream(b, AAUDIO_DIRECTION_INPUT, WANT_CAP_CHANNELS);
-    if (b->rec) {
-        b->cap_rate = AAudioStream_getSampleRate(b->rec);
-        b->cap_channels = AAudioStream_getChannelCount(b->rec);
-    }
+    b->capture_gated = false;
+    b->capture_active = false;
+    b->mic_reroute = false;
     LOGI("device formats: playback %d Hz x%d, capture %d Hz x%d",
          b->play_rate, b->play_channels, b->cap_rate, b->cap_channels);
 
@@ -734,11 +872,7 @@ void audio_stop(audio_bridge *b)
     pthread_join(b->cap_thread, NULL);
 
     close_play_stream(b, true);
-    if (b->rec) {
-        AAudioStream_requestStop(b->rec);
-        AAudioStream_close(b->rec);
-        b->rec = NULL;
-    }
+    close_rec(b);
     pthread_mutex_lock(&b->play_lock);
     free(b->play_ring);
     b->play_ring = NULL;
@@ -751,8 +885,14 @@ void audio_stop(audio_bridge *b)
 
 void audio_set_ctx(audio_bridge *b, display_ctx *ctx)
 {
-    if (b)
-        b->ctx = ctx;
+    if (!b)
+        return;
+    /* Reset capture gating here too, before the capture thread can see the new fd:
+     * the playback thread only notices the change on its next pass. */
+    b->capture_gated = false;
+    b->capture_active = false;
+    b->connected_ms = now_ms();
+    b->ctx = ctx;
 }
 
 void audio_set_mic_enabled(audio_bridge *b, int enabled)
@@ -779,4 +919,19 @@ void audio_set_keepalive(audio_bridge *b, int enabled)
         return;
     b->keepalive_enabled = enabled != 0;
     LOGI("audio keep-alive %s", b->keepalive_enabled ? "enabled" : "disabled");
+}
+
+void audio_set_mic_router(audio_bridge *b, audio_mic_route_fn fn, void *userdata)
+{
+    if (!b)
+        return;
+    b->mic_route_data = userdata;
+    b->mic_route = fn;
+}
+
+void audio_request_mic_reroute(audio_bridge *b)
+{
+    if (!b)
+        return;
+    b->mic_reroute = true;   /* acted on by the capture thread only while recording */
 }

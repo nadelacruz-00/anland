@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -34,6 +35,10 @@
 #define MAX_AUDIO_QUANTUM  65536
 #define KEEPALIVE_FRAMES       480
 #define KEEPALIVE_BYTES        (KEEPALIVE_FRAMES * DEFAULT_PLAY_CHANNELS * (int) sizeof (int16_t))
+/* After the last app stops recording, wait this long before telling the consumer, so an
+ * app that closes and reopens the mic does not make Android drop and re-take a
+ * Bluetooth headset (which would also interrupt its high-quality playback). */
+#define CAPTURE_IDLE_GRACE_SECS 2
 
 struct _MetaAnlandAudio
 {
@@ -48,6 +53,15 @@ struct _MetaAnlandAudio
   struct spa_hook capture_listener;
   struct pw_stream *source;
   struct spa_hook source_listener;
+
+  /* Links from anland-mic to recording apps, tracked through the registry: the source
+   * follows the always-running anland-speaker driver, so its own stream state stays
+   * STREAMING (and its format set) whether or not anything records from it. */
+  struct pw_registry *registry;
+  struct spa_hook registry_listener;
+  GHashTable *mic_links;
+  struct spa_source *capture_idle_timer;
+  bool capture_active;
 
   uint32_t play_rate;
   uint32_t play_channels;
@@ -131,6 +145,117 @@ ring_read (MetaAnlandAudio *audio,
   audio->ring_fill -= available;
   return available;
 }
+
+/* Tell the consumer whether a desktop app is recording from anland-mic, so it only
+ * opens the Android mic (and a Bluetooth headset) while one is. */
+static void
+send_capture_state (MetaAnlandAudio *audio)
+{
+  uint32_t active = audio->capture_active ? 1 : 0;
+  struct audio_msg header = {
+    .type = AUDIO_MSG_CAPTURE_STATE,
+    .size = sizeof (active),
+  };
+  struct iovec iov[2] = {
+    { .iov_base = &header, .iov_len = sizeof (header) },
+    { .iov_base = &active, .iov_len = sizeof (active) },
+  };
+  struct msghdr message = {
+    .msg_iov = iov,
+    .msg_iovlen = G_N_ELEMENTS (iov),
+  };
+
+  if (audio->audio_fd >= 0)
+    sendmsg (audio->audio_fd, &message, MSG_DONTWAIT | MSG_NOSIGNAL);
+}
+
+static void
+set_capture_active (MetaAnlandAudio *audio,
+                    bool             active)
+{
+  if (audio->capture_active == active)
+    return;
+
+  audio->capture_active = active;
+  if (active)
+    g_message ("anland-mic: a desktop app is recording");
+  else
+    g_message ("anland-mic: no app is recording, releasing the mic");
+  send_capture_state (audio);
+}
+
+static void
+arm_capture_idle_timer (MetaAnlandAudio *audio,
+                        bool             arm)
+{
+  struct timespec value = {
+    .tv_sec = arm ? CAPTURE_IDLE_GRACE_SECS : 0,
+    .tv_nsec = 0,
+  };
+
+  if (!audio->capture_idle_timer)
+    return;
+  pw_loop_update_timer (pw_thread_loop_get_loop (audio->loop),
+                        audio->capture_idle_timer, &value, NULL, false);
+}
+
+static void
+on_capture_idle_timer (void     *user_data,
+                       uint64_t  expirations)
+{
+  MetaAnlandAudio *audio = user_data;
+
+  (void) expirations;
+
+  if (g_hash_table_size (audio->mic_links) == 0)
+    set_capture_active (audio, false);
+}
+
+static void
+on_registry_global (void                  *user_data,
+                    uint32_t               id,
+                    uint32_t               permissions,
+                    const char            *type,
+                    uint32_t               version,
+                    const struct spa_dict *props)
+{
+  MetaAnlandAudio *audio = user_data;
+  const char *output_node;
+  uint32_t source_id;
+
+  (void) permissions;
+  (void) version;
+
+  if (!props || !audio->source || strcmp (type, PW_TYPE_INTERFACE_Link) != 0)
+    return;
+
+  source_id = pw_stream_get_node_id (audio->source);
+  output_node = spa_dict_lookup (props, PW_KEY_LINK_OUTPUT_NODE);
+  if (source_id == SPA_ID_INVALID || !output_node ||
+      strtoul (output_node, NULL, 10) != source_id)
+    return;
+
+  g_hash_table_add (audio->mic_links, GUINT_TO_POINTER (id));
+  arm_capture_idle_timer (audio, false);
+  set_capture_active (audio, true);
+}
+
+static void
+on_registry_global_remove (void     *user_data,
+                           uint32_t  id)
+{
+  MetaAnlandAudio *audio = user_data;
+
+  if (g_hash_table_remove (audio->mic_links, GUINT_TO_POINTER (id)) &&
+      g_hash_table_size (audio->mic_links) == 0)
+    arm_capture_idle_timer (audio, true);
+}
+
+static const struct pw_registry_events registry_events = {
+  PW_VERSION_REGISTRY_EVENTS,
+  .global = on_registry_global,
+  .global_remove = on_registry_global_remove,
+};
 
 static void
 on_capture_process (void *user_data)
@@ -429,6 +554,18 @@ connect_stream (struct pw_stream  *stream,
 static void
 teardown_pw (MetaAnlandAudio *audio)
 {
+  if (audio->registry)
+    {
+      spa_hook_remove (&audio->registry_listener);
+      pw_proxy_destroy ((struct pw_proxy *) audio->registry);
+      audio->registry = NULL;
+    }
+  /* The links die with the source: report idle now rather than leave the consumer
+   * holding the mic (and a headset) until a new link comes and goes. */
+  g_hash_table_remove_all (audio->mic_links);
+  arm_capture_idle_timer (audio, false);
+  set_capture_active (audio, false);
+
   if (audio->capture)
     {
       spa_hook_remove (&audio->capture_listener);
@@ -503,6 +640,12 @@ build_pw (MetaAnlandAudio *audio)
                       audio->cap_channels, audio->cap_quantum) < 0)
     return -1;
 
+  audio->registry = pw_core_get_registry (audio->core, PW_VERSION_REGISTRY, 0);
+  if (!audio->registry)
+    return -1;
+  pw_registry_add_listener (audio->registry, &audio->registry_listener,
+                            &registry_events, audio);
+
   return 0;
 }
 
@@ -569,6 +712,9 @@ meta_anland_audio_set_fd (MetaAnlandAudio *audio,
           close (audio->audio_fd);
           audio->audio_fd = -1;
         }
+      /* Also tells the consumer that this producer sends capture state, so it stops
+       * keeping the mic open whenever its mic setting is on. */
+      send_capture_state (audio);
     }
 
   pw_thread_loop_unlock (audio->loop);
@@ -594,6 +740,7 @@ meta_anland_audio_new (void)
   audio->ring = g_malloc (audio->ring_size);
   if (!audio->ring)
     goto fail;
+  audio->mic_links = g_hash_table_new (g_direct_hash, g_direct_equal);
 
   audio->loop = pw_thread_loop_new ("anland-audio", NULL);
   if (!audio->loop)
@@ -607,6 +754,11 @@ meta_anland_audio_new (void)
   audio->reconnect_timer = pw_loop_add_timer (
     pw_thread_loop_get_loop (audio->loop), on_reconnect_timer, audio);
   if (!audio->reconnect_timer)
+    goto fail;
+
+  audio->capture_idle_timer = pw_loop_add_timer (
+    pw_thread_loop_get_loop (audio->loop), on_capture_idle_timer, audio);
+  if (!audio->capture_idle_timer)
     goto fail;
 
   if (pw_thread_loop_start (audio->loop) < 0)
@@ -633,10 +785,14 @@ fail:
   if (audio->reconnect_timer)
     pw_loop_destroy_source (pw_thread_loop_get_loop (audio->loop),
                             audio->reconnect_timer);
+  if (audio->capture_idle_timer)
+    pw_loop_destroy_source (pw_thread_loop_get_loop (audio->loop),
+                            audio->capture_idle_timer);
   if (audio->context)
     pw_context_destroy (audio->context);
   if (audio->loop)
     pw_thread_loop_destroy (audio->loop);
+  g_clear_pointer (&audio->mic_links, g_hash_table_destroy);
   g_free (audio->ring);
   g_free (audio);
 fail_init:
@@ -657,12 +813,16 @@ meta_anland_audio_free (MetaAnlandAudio *audio)
   if (audio->reconnect_timer)
     pw_loop_destroy_source (pw_thread_loop_get_loop (audio->loop),
                             audio->reconnect_timer);
+  if (audio->capture_idle_timer)
+    pw_loop_destroy_source (pw_thread_loop_get_loop (audio->loop),
+                            audio->capture_idle_timer);
   if (audio->audio_fd >= 0)
     close (audio->audio_fd);
   if (audio->context)
     pw_context_destroy (audio->context);
   if (audio->loop)
     pw_thread_loop_destroy (audio->loop);
+  g_clear_pointer (&audio->mic_links, g_hash_table_destroy);
   g_free (audio->ring);
   g_free (audio);
 }

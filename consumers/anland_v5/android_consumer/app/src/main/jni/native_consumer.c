@@ -122,6 +122,10 @@ struct consumer_state {
     /* Per-instance audio bridge (own AAudio streams, own producer). */
     audio_bridge *audio;
 
+    /* Java MicRouter (global ref, or NULL) that picks and releases a headset mic;
+     * on_mic_route() calls it from the audio capture thread. Set before nativeStart. */
+    jobject mic_router_obj;
+
     /* Per-instance camera service registration; userdata points back at this state
      * so the camera layer can tell instances apart (see camera_service.c). */
     struct service_info camera_svc;
@@ -1108,11 +1112,14 @@ Java_com_anland_consumer_Native_nativeDestroy(JNIEnv *env, jclass clazz, jlong h
             (*e)->DeleteGlobalRef(e, s->clipboard_obj);
             if (s->activity_obj)
                 (*e)->DeleteGlobalRef(e, s->activity_obj);
+            if (s->mic_router_obj)
+                (*e)->DeleteGlobalRef(e, s->mic_router_obj);
         }
         if (attached)
             (*g_jvm)->DetachCurrentThread(g_jvm);
     }
     s->activity_obj = NULL;
+    s->mic_router_obj = NULL;
     pthread_mutex_destroy(&s->topapp_lock);
     pthread_mutex_destroy(&s->cfg_lock);
     pthread_mutex_destroy(&s->lock);
@@ -1579,4 +1586,64 @@ Java_com_anland_consumer_Native_nativeSetAudioKeepalive(
     if (!s)
         return;
     audio_set_keepalive(s->audio, enabled == JNI_TRUE);
+}
+
+/* audio_mic_route_fn for this instance: ask the Java MicRouter to route (active) or
+ * release (!active) the mic. Runs on the audio capture thread, so attach for the call.
+ * Returns the AAudio input device id to record from, 0 for the default input. */
+static int on_mic_route(void *userdata, int active)
+{
+    struct consumer_state *s = userdata;
+    JNIEnv *env = NULL;
+    bool attached = false;
+    int device = 0;
+
+    if (!g_jvm || !s->mic_router_obj)
+        return 0;
+    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+        if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != 0)
+            return 0;
+        attached = true;
+    }
+    jclass cls = (*env)->GetObjectClass(env, s->mic_router_obj);
+    jmethodID mid = (*env)->GetMethodID(env, cls, "onMicCapture", "(Z)I");
+    if (mid)
+        device = (*env)->CallIntMethod(env, s->mic_router_obj, mid,
+                                       active ? JNI_TRUE : JNI_FALSE);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+        device = 0;
+    }
+    (*env)->DeleteLocalRef(env, cls);
+    if (attached)
+        (*g_jvm)->DetachCurrentThread(g_jvm);
+    return device;
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeSetMicRouter(
+    JNIEnv *env, jclass clazz, jlong handle, jobject router)
+{
+    struct consumer_state *s = STATE(handle);
+    if (!s)
+        return;
+    if (!g_jvm)
+        (*env)->GetJavaVM(env, &g_jvm);
+    audio_set_mic_router(s->audio, NULL, NULL);
+    if (s->mic_router_obj)
+        (*env)->DeleteGlobalRef(env, s->mic_router_obj);
+    s->mic_router_obj = router ? (*env)->NewGlobalRef(env, router) : NULL;
+    if (s->mic_router_obj)
+        audio_set_mic_router(s->audio, on_mic_route, s);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_consumer_Native_nativeRequestMicReroute(
+    JNIEnv *env, jclass clazz, jlong handle)
+{
+    struct consumer_state *s = STATE(handle);
+    if (!s)
+        return;
+    audio_request_mic_reroute(s->audio);
 }

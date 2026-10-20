@@ -10,13 +10,16 @@
  *                AAudio output stream (the Android speaker);
  *   - capture : reads the Android mic via an AAudio input stream and writes PCM
  *                datagrams to the socket (the producer exposes them as a Linux
- *                recording source). Only active while the mic is enabled.
+ *                recording source). Only active while the mic is enabled and, when
+ *                the producer reports it (AUDIO_MSG_CAPTURE_STATE), only while a
+ *                desktop app records; it may then be routed to a Bluetooth headset.
  *
  * The playback AAudio stream stays open and is driven by an AAudio callback. The
  * socket thread appends PCM into a small ring buffer; the callback outputs an
  * inaudible keepalive when Linux is idle. This keeps Android's mixer awake across
  * short UI sounds without reconnecting the display pipeline. The capture stream is
- * opened once and only started while the mic is enabled. The active display_ctx
+ * opened by the capture thread only while it records and closed afterwards, so the
+ * mic (and a headset's call mode) is free otherwise. The active display_ctx
  * (and thus the live audio fd) is swapped via audio_set_ctx(). The audio fd is
  * owned by the display library -- never closed here.
  *
@@ -53,5 +56,17 @@ void audio_set_latency(audio_bridge *b, int speaker_ms, int mic_ms);
  * always play immediately), or let it idle-stop after silence to save standby power.
  * Default is disabled. Takes effect on the playback thread's next loop pass. */
 void audio_set_keepalive(audio_bridge *b, int enabled);
+
+/* Mic routing hook, called on the capture thread, and only on connections whose
+ * producer reports capture state. active=1: a desktop app started recording; return
+ * the AAudio input device id to capture from (0 = Android's default input).
+ * active=0: capture stopped; release any routing (the return value is ignored).
+ * Set it before audio_start(); fn NULL disables routing. */
+typedef int (*audio_mic_route_fn)(void *userdata, int active);
+void audio_set_mic_router(audio_bridge *b, audio_mic_route_fn fn, void *userdata);
+
+/* The preferred mic changed (e.g. a headset connected): reopen the capture stream
+ * through the router if it is recording. Safe from any thread. */
+void audio_request_mic_reroute(audio_bridge *b);
 
 #endif

@@ -282,6 +282,12 @@ struct OutputEvent{
 #define AUDIO_MSG_PCM    2
 #define AUDIO_MSG_SHM 3 // request shared-memory ring-buffer audio transport instead of socket sends (fewer copies, lower latency)
 #define AUDIO_MSG_SHM_FD 4 // producer -> consumer: shared-memory fd, consumer mmaps it and reads audio data directly
+/* producer -> consumer: payload is one uint32_t, 1 while a desktop app records from the
+ * virtual mic source, 0 once none does. A consumer that has seen this message on a
+ * connection captures the mic only while it is 1 (and may route it to a headset then);
+ * without it the consumer captures whenever its mic setting is on. Consumers that
+ * predate it ignore it (they only read AUDIO_MSG_PCM from the producer). */
+#define AUDIO_MSG_CAPTURE_STATE 5
 
 /* PCM sample format codes for struct audio_format.format. */
 #define AUDIO_FORMAT_S16LE 0
@@ -299,7 +305,7 @@ struct audio_format {
 } __attribute__((packed));
 
 struct audio_msg {
-    uint32_t type;       /* AUDIO_MSG_FORMAT | AUDIO_MSG_PCM */
+    uint32_t type;       /* AUDIO_MSG_FORMAT | AUDIO_MSG_PCM | AUDIO_MSG_CAPTURE_STATE */
     uint32_t size;       /* payload bytes that follow this header */
 } __attribute__((packed));
 
