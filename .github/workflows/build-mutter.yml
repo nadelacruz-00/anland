@@ -47,6 +47,9 @@ jobs:
           echo "--- patch targets mutter 50.1? ---"
           grep -m1 -o 'clutter_stage_view_present@Base 50.1' producers/gnome/Ubuntu2604_v5/mutter.patch || true
 
+      - name: Test the Anland audio gate
+        run: sh producers/gnome/anland_backend/tests/run_audio_gate_tests.sh
+
       - name: Build .debs inside an Ubuntu 26.04 arm64 container
         env:
           MUTTER_VERSION: ${{ inputs.mutter_version }}

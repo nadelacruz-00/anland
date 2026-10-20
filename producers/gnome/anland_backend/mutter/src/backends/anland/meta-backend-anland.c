@@ -92,7 +92,30 @@ struct _MetaBackendAnland
   int64_t pending_global_frame_counter;
   int64_t pending_view_frame_counter;
   unsigned int presentation_sequence;
+
+  /* Paint only when something changed. The consumer hands back a buffer after every
+   * frame; forcing a full repaint for each hand-off kept the GPU redrawing a still
+   * desktop at the display rate. With this on, a hand-off only records the target;
+   * stage damage paints it (widened to the full screen, see on_stage_before_paint),
+   * and a keep-alive repaint every ANLAND_KEEPALIVE_MS keeps the consumer's 5 s
+   * frame timeout (refresh_done) from firing on a still screen.
+   * ANLAND_PAINT_ON_CHANGE=0 restores a full repaint per hand-off. */
+  gboolean paint_on_change;
+  gboolean first_paint_pending;   /* paint the first target of a session at once */
+  guint keepalive_source_id;      /* armed while a target waits for a present */
+  gboolean keepalive_frame;       /* the frame being painted was a keep-alive */
+  ClutterActor *before_paint_stage;
+  gulong before_paint_handler_id;
+
+  /* ANLAND_FRAME_STATS=1: log presented frames every 10 s, split by cause. */
+  gboolean frame_stats;
+  guint stats_change_frames;
+  guint stats_keepalive_frames;
+  int64_t stats_start_us;
 };
+
+#define ANLAND_KEEPALIVE_MS 2000
+#define ANLAND_FRAME_STATS_INTERVAL_US (10 * G_USEC_PER_SEC)
 
 G_DEFINE_TYPE (MetaBackendAnland, meta_backend_anland, META_TYPE_BACKEND_NATIVE)
 
@@ -577,6 +600,94 @@ uninhibit_frame_clock (MetaBackendAnland *backend)
 }
 
 static void
+disarm_keepalive (MetaBackendAnland *backend)
+{
+  g_clear_handle_id (&backend->keepalive_source_id, g_source_remove);
+}
+
+/* No change for ANLAND_KEEPALIVE_MS while the consumer waits for a frame: repaint
+ * the whole screen through the normal frame path, so the consumer gets a frame well
+ * inside its 5 s timeout. Stays armed (fires again) until a present succeeds, so a
+ * refused or dropped present is retried. */
+static gboolean
+on_keepalive (gpointer user_data)
+{
+  MetaBackendAnland *backend = user_data;
+
+  if (!backend->consumer_active || !backend->stage_view)
+    {
+      backend->keepalive_source_id = 0;
+      return G_SOURCE_REMOVE;
+    }
+
+  backend->keepalive_frame = TRUE;
+  clutter_stage_view_add_redraw_clip (CLUTTER_STAGE_VIEW (backend->stage_view),
+                                      NULL);
+  clutter_stage_view_schedule_update (CLUTTER_STAGE_VIEW (backend->stage_view));
+  return G_SOURCE_CONTINUE;
+}
+
+static void
+arm_keepalive (MetaBackendAnland *backend)
+{
+  if (backend->keepalive_source_id)
+    return;
+  backend->keepalive_source_id = g_timeout_add (ANLAND_KEEPALIVE_MS,
+                                                on_keepalive, backend);
+  g_source_set_name_by_id (backend->keepalive_source_id,
+                           "[mutter] Anland keep-alive");
+}
+
+/* Every paint into a consumer buffer must cover the whole screen: the buffers are
+ * offscreen, so Clutter redraws only the damaged area into them
+ * (meta-stage-impl.c should_use_clipped_redraw), while each buffer holds a frame
+ * from several hand-offs ago. "before-paint" is emitted only when the view has a
+ * redraw clip, and before the redraw takes the accumulated clip, so widening it
+ * here keeps stale regions off the screen without painting undamaged frames. */
+static void
+on_stage_before_paint (ClutterStage     *stage,
+                       ClutterStageView *view,
+                       ClutterFrame     *frame,
+                       gpointer          user_data)
+{
+  MetaBackendAnland *backend = user_data;
+
+  if (!backend->paint_on_change || !backend->consumer_active ||
+      view != CLUTTER_STAGE_VIEW (backend->stage_view))
+    return;
+
+  clutter_stage_view_add_redraw_clip (view, NULL);
+}
+
+static void
+count_presented_frame (MetaBackendAnland *backend)
+{
+  int64_t now_us;
+
+  if (backend->keepalive_frame)
+    backend->stats_keepalive_frames++;
+  else
+    backend->stats_change_frames++;
+  backend->keepalive_frame = FALSE;
+
+  if (!backend->frame_stats)
+    return;
+
+  now_us = g_get_monotonic_time ();
+  if (backend->stats_start_us == 0)
+    backend->stats_start_us = now_us;
+  if (now_us - backend->stats_start_us < ANLAND_FRAME_STATS_INTERVAL_US)
+    return;
+
+  g_message ("anland-frames: %u change-driven, %u keep-alive in %.1f s",
+             backend->stats_change_frames, backend->stats_keepalive_frames,
+             (now_us - backend->stats_start_us) / (double) G_USEC_PER_SEC);
+  backend->stats_change_frames = 0;
+  backend->stats_keepalive_frames = 0;
+  backend->stats_start_us = now_us;
+}
+
+static void
 release_stage_view (MetaBackendAnland *backend)
 {
   if (!backend->stage_view)
@@ -585,6 +696,7 @@ release_stage_view (MetaBackendAnland *backend)
   g_return_if_fail (!backend->consumer_active);
   g_return_if_fail (!backend->frame_pending);
 
+  disarm_keepalive (backend);
   uninhibit_frame_clock (backend);
   g_clear_object (&backend->placeholder_framebuffer);
   g_clear_object (&backend->stage_view);
@@ -746,6 +858,8 @@ deactivate_consumer_full (MetaBackendAnland *backend,
   /* No commit can complete once the session is gone: forget it here so a late
    * PRESENTED/DROPPED from the old session cannot end a future frame. */
   backend->pending_commit_id = 0;
+  disarm_keepalive (backend);
+  backend->keepalive_frame = FALSE;
   inhibit_frame_clock (backend);
 }
 
@@ -816,9 +930,18 @@ apply_render_target (MetaBackendAnland *backend)
       backend->current_buffer = (int) index;
     }
 
+  uninhibit_frame_clock (backend);
+
+  if (backend->paint_on_change && !backend->first_paint_pending)
+    {
+      /* Paint only when the stage has damage; keep the consumer fed meanwhile. */
+      arm_keepalive (backend);
+      return;
+    }
+
+  backend->first_paint_pending = FALSE;
   clutter_stage_view_add_redraw_clip (CLUTTER_STAGE_VIEW (backend->stage_view),
                                       NULL);
-  uninhibit_frame_clock (backend);
   clutter_stage_view_schedule_update_now (CLUTTER_STAGE_VIEW (backend->stage_view));
 }
 
@@ -1044,6 +1167,9 @@ on_stage_view_present (ClutterStageView *stage_view,
     }
 
   inhibit_frame_clock (backend);
+  /* The consumer has its frame: the keep-alive re-arms with the next target. */
+  disarm_keepalive (backend);
+  count_presented_frame (backend);
   clutter_frame_set_result (frame, CLUTTER_FRAME_RESULT_PENDING_PRESENTED);
   return TRUE;
 }
@@ -1281,6 +1407,14 @@ activate_consumer (MetaBackendAnland *backend)
   backend->session_generation = anland_scene_generation (
     anland_de_backend_scene (backend->present_backend));
   backend->buffer_count = (uint32_t) n_buffers;
+  backend->first_paint_pending = TRUE;
+  if (backend->paint_on_change && !backend->before_paint_handler_id)
+    {
+      backend->before_paint_stage = meta_backend_get_stage (META_BACKEND (backend));
+      backend->before_paint_handler_id =
+        g_signal_connect (backend->before_paint_stage, "before-paint",
+                          G_CALLBACK (on_stage_before_paint), backend);
+    }
   inhibit_frame_clock (backend);
   clutter_stage_view_set_present_func (CLUTTER_STAGE_VIEW (backend->stage_view),
                                        on_stage_view_present, backend);
@@ -1497,6 +1631,10 @@ meta_backend_anland_dispose (GObject *object)
   MetaBackendAnland *backend = META_BACKEND_ANLAND (object);
 
   g_clear_handle_id (&backend->reconnect_source_id, g_source_remove);
+  disarm_keepalive (backend);
+  if (backend->before_paint_handler_id)
+    g_clear_signal_handler (&backend->before_paint_handler_id,
+                            backend->before_paint_stage);
   clear_device (backend);
   uninhibit_frame_clock (backend);
   g_clear_pointer (&backend->audio, meta_anland_audio_free);
@@ -1535,6 +1673,12 @@ meta_backend_anland_init (MetaBackendAnland *backend_anland)
 {
   backend_anland->socket_path = get_default_socket_path ();
   backend_anland->current_buffer = -1;
+  backend_anland->paint_on_change =
+    g_strcmp0 (g_getenv ("ANLAND_PAINT_ON_CHANGE"), "0") != 0;
+  backend_anland->frame_stats =
+    g_strcmp0 (g_getenv ("ANLAND_FRAME_STATS"), "1") == 0;
+  if (!backend_anland->paint_on_change)
+    g_message ("Anland: ANLAND_PAINT_ON_CHANGE=0, repainting on every buffer hand-off");
 }
 
 gboolean

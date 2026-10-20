@@ -3,6 +3,7 @@
 #include "config.h"
 
 #include "backends/anland/meta-anland-audio.h"
+#include "backends/anland/meta-anland-audio-gate.h"
 
 #include "backends/anland/common/protocol.h"
 
@@ -62,6 +63,13 @@ struct _MetaAnlandAudio
   GHashTable *mic_links;
   struct spa_source *capture_idle_timer;
   bool capture_active;
+
+  /* Audio out (speaker -> consumer): forward only while the desktop is actually
+   * making sound (see meta-anland-audio-gate.h), so the consumer's Android output
+   * can idle-stop. Gate state lives in the realtime capture callback only.
+   * ANLAND_AUDIO_IDLE=0 restores forwarding every chunk, silence included. */
+  bool audio_idle;
+  AnlandAudioGate out_gate;
 
   uint32_t play_rate;
   uint32_t play_channels;
@@ -257,6 +265,31 @@ static const struct pw_registry_events registry_events = {
   .global_remove = on_registry_global_remove,
 };
 
+static int
+on_audio_out_state (struct spa_loop *loop,
+                    bool             async,
+                    uint32_t         seq,
+                    const void      *data,
+                    size_t           size,
+                    void            *user_data)
+{
+  bool active;
+
+  (void) loop;
+  (void) async;
+  (void) seq;
+  (void) user_data;
+
+  if (size != sizeof (active))
+    return 0;
+  memcpy (&active, data, sizeof (active));
+  if (active)
+    g_message ("anland-audio: audio out active");
+  else
+    g_message ("anland-audio: audio out silent, letting the tablet sleep");
+  return 0;
+}
+
 static void
 on_capture_process (void *user_data)
 {
@@ -271,13 +304,44 @@ on_capture_process (void *user_data)
   data = &buffer->buffer->datas[0];
   if (audio->audio_fd >= 0)
     {
-      const uint8_t *payload = audio->silence;
-      size_t payload_size = sizeof (audio->silence);
+      const uint8_t *payload = NULL;
+      size_t payload_size = 0;
 
       if (data->data && data->chunk && data->chunk->size > 0)
         {
           payload = (uint8_t *) data->data + data->chunk->offset;
           payload_size = data->chunk->size;
+        }
+
+      if (audio->audio_idle)
+        {
+          bool changed = false;
+          bool forward = anland_audio_gate_forward (
+            &audio->out_gate,
+            anland_audio_chunk_has_sound (payload, payload_size),
+            g_get_monotonic_time (), &changed);
+
+          if (changed)
+            {
+              bool active = audio->out_gate.active;
+
+              /* Realtime thread: hand the log line to the thread loop, never block. */
+              pw_loop_invoke (pw_thread_loop_get_loop (audio->loop),
+                              on_audio_out_state, SPA_ID_INVALID,
+                              &active, sizeof (active), false, audio);
+            }
+          if (!forward)
+            {
+              pw_stream_queue_buffer (audio->capture, buffer);
+              return;
+            }
+        }
+
+      if (!payload)
+        {
+          /* Empty chunk inside the grace period (or gate off): keep the pacing. */
+          payload = audio->silence;
+          payload_size = sizeof (audio->silence);
         }
 
       struct audio_msg header = {
@@ -732,6 +796,9 @@ meta_anland_audio_new (void)
     goto fail_init;
 
   audio->audio_fd = -1;
+  audio->audio_idle = g_strcmp0 (g_getenv ("ANLAND_AUDIO_IDLE"), "0") != 0;
+  if (!audio->audio_idle)
+    g_message ("anland-audio: ANLAND_AUDIO_IDLE=0, forwarding silence as before");
   audio->play_rate = DEFAULT_RATE;
   audio->play_channels = DEFAULT_PLAY_CHANNELS;
   audio->cap_rate = DEFAULT_RATE;
