@@ -73,11 +73,20 @@ _Static_assert(sizeof(struct cam_stream_msg) == 12,
 #define CAM_FPS     30
 
 /* Largest size ever requested from the consumer (same rule as the consumer's
- * camera_size.h), and the standard size requested when it reports more. */
+ * camera_size.h), and the standard size requested when it reports more. By default
+ * the cap is the standard size itself: calls send at most 720p, and every 1080p frame
+ * costs a core-sized share of this 4-CPU container across the bridge copy and the
+ * app's conversion and encoders (a call with camera and screen share lagged the
+ * desktop). MUTTER_ANLAND_CAMERA_1080P=1 allows up to 1080p (e.g. for OBS). */
 #define CAM_CAP_W   1920
 #define CAM_CAP_H   1080
 #define CAM_CLAMP_W 1280
 #define CAM_CLAMP_H 720
+
+static bool camera_allow_1080p(void)
+{
+    return g_strcmp0(g_getenv("MUTTER_ANLAND_CAMERA_1080P"), "1") == 0;
+}
 
 #define MAX_CAMERAS 8
 #define RECONNECT_SECS 1
@@ -247,11 +256,14 @@ handle_camera_info(struct anland_camera *c,
         if (!camera_frame_size(width, height, &frame_size))
             return false;
 
-        /* Never ask the consumer for more than 1080p, whatever it reports: an older
-         * consumer reports the full sensor size, and streaming it once OOM'd the whole
-         * Android device. 1280x720 is listed by practically every camera; the consumer
-         * caps by the same rule (camera_size.h). */
-        if (width > CAM_CAP_W || height > CAM_CAP_H) {
+        /* Never ask the consumer for more than the cap (720p by default, 1080p at
+         * most), whatever it reports: an older consumer reports the full sensor size,
+         * and streaming it once OOM'd the whole Android device. 1280x720 is listed by
+         * practically every camera; the consumer caps at 1080p by the same rule
+         * (camera_size.h). */
+        const uint32_t cap_w = camera_allow_1080p() ? CAM_CAP_W : CAM_CLAMP_W;
+        const uint32_t cap_h = camera_allow_1080p() ? CAM_CAP_H : CAM_CLAMP_H;
+        if (width > cap_w || height > cap_h) {
             g_message("anland-camera: camera %d reports %ux%u, requesting %ux%u",
                       i, width, height, CAM_CLAMP_W, CAM_CLAMP_H);
             width = CAM_CLAMP_W;
