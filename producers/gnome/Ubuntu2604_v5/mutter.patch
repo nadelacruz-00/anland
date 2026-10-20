@@ -1348,3 +1348,211 @@ diff --git a/src/wayland/meta-wayland-touch.c b/src/wayland/meta-wayland-touch.c
    if (touch_info->focus_surface->surface == surface)
      return TRUE;
  
+diff --git a/src/backends/meta-screen-cast-monitor-stream-src.c b/src/backends/meta-screen-cast-monitor-stream-src.c
+index eea0fd1..2d2ad78 100644
+--- a/src/backends/meta-screen-cast-monitor-stream-src.c
++++ b/src/backends/meta-screen-cast-monitor-stream-src.c
+@@ -22,6 +22,7 @@
+ 
+ #include "backends/meta-screen-cast-monitor-stream-src.h"
+ 
++#include <float.h>
+ #include <spa/buffer/meta.h>
+ 
+ #include "backends/meta-backend-private.h"
+@@ -114,6 +115,15 @@ get_monitor (MetaScreenCastMonitorStreamSrc *monitor_src)
+   return meta_screen_cast_monitor_stream_get_monitor (monitor_stream);
+ }
+ 
++static float
++get_stream_scale (MetaScreenCastMonitorStreamSrc *monitor_src)
++{
++  MetaScreenCastStreamSrc *src = META_SCREEN_CAST_STREAM_SRC (monitor_src);
++  MetaScreenCastStream *stream = meta_screen_cast_stream_src_get_stream (src);
++
++  return meta_screen_cast_monitor_stream_get_scale (META_SCREEN_CAST_MONITOR_STREAM (stream));
++}
++
+ static gboolean
+ meta_screen_cast_monitor_stream_src_get_specs (MetaScreenCastStreamSrc *src,
+                                                int                     *width,
+@@ -122,7 +132,6 @@ meta_screen_cast_monitor_stream_src_get_specs (MetaScreenCastStreamSrc *src,
+ {
+   MetaScreenCastMonitorStreamSrc *monitor_src =
+     META_SCREEN_CAST_MONITOR_STREAM_SRC (src);
+-  MetaBackend *backend = get_backend (monitor_src);
+   MetaMonitor *monitor;
+   MetaLogicalMonitor *logical_monitor;
+   float scale;
+@@ -132,10 +141,7 @@ meta_screen_cast_monitor_stream_src_get_specs (MetaScreenCastStreamSrc *src,
+   logical_monitor = meta_monitor_get_logical_monitor (monitor);
+   mode = meta_monitor_get_current_mode (monitor);
+ 
+-  if (meta_backend_is_stage_views_scaled (backend))
+-    scale = logical_monitor->scale;
+-  else
+-    scale = 1.0;
++  scale = get_stream_scale (monitor_src);
+ 
+   *width = (int) roundf (logical_monitor->rect.width * scale);
+   *height = (int) roundf (logical_monitor->rect.height * scale);
+@@ -574,7 +580,6 @@ meta_screen_cast_monitor_stream_src_record_to_buffer (MetaScreenCastStreamSrc
+   MetaScreenCastMonitorStreamSrc *monitor_src =
+     META_SCREEN_CAST_MONITOR_STREAM_SRC (src);
+   MetaScreenCastStream *stream = meta_screen_cast_stream_src_get_stream (src);
+-  MetaBackend *backend = get_backend (monitor_src);
+   ClutterStage *stage;
+   MetaMonitor *monitor;
+   MetaLogicalMonitor *logical_monitor;
+@@ -586,10 +591,7 @@ meta_screen_cast_monitor_stream_src_record_to_buffer (MetaScreenCastStreamSrc
+   logical_monitor = meta_monitor_get_logical_monitor (monitor);
+   stage = get_stage (monitor_src);
+ 
+-  if (meta_backend_is_stage_views_scaled (backend))
+-    scale = meta_logical_monitor_get_scale (logical_monitor);
+-  else
+-    scale = 1.0;
++  scale = get_stream_scale (monitor_src);
+ 
+   switch (meta_screen_cast_stream_get_cursor_mode (stream))
+     {
+@@ -717,14 +719,18 @@ meta_screen_cast_monitor_stream_src_record_to_framebuffer (MetaScreenCastStreamS
+   logical_monitor = meta_monitor_get_logical_monitor (monitor);
+   logical_monitor_layout = meta_logical_monitor_get_layout (logical_monitor);
+ 
+-  if (meta_backend_is_stage_views_scaled (backend))
+-    view_scale = meta_logical_monitor_get_scale (logical_monitor);
+-  else
+-    view_scale = 1.0;
++  view_scale = get_stream_scale (monitor_src);
+ 
+   if (paint_phase == META_SCREEN_CAST_PAINT_PHASE_DETACHED)
+     goto stage_paint;
+ 
++  /* The scanout copy and the view blit are full size; a stream at another scale
++   * (see meta_screen_cast_monitor_stream_get_scale) is painted at its own size. */
++  if (meta_backend_is_stage_views_scaled (backend) &&
++      !G_APPROX_VALUE (view_scale, meta_logical_monitor_get_scale (logical_monitor),
++                       FLT_EPSILON))
++    goto stage_paint;
++
+   outputs = meta_monitor_get_outputs (monitor);
+   if (outputs->next)
+     goto stage_paint;
+@@ -934,17 +940,7 @@ should_cursor_metadata_be_set (MetaScreenCastMonitorStreamSrc *monitor_src)
+ static float
+ get_view_scale (MetaScreenCastMonitorStreamSrc *monitor_src)
+ {
+-  MetaBackend *backend = get_backend (monitor_src);
+-  MetaMonitor *monitor;
+-  MetaLogicalMonitor *logical_monitor;
+-
+-  monitor = get_monitor (monitor_src);
+-  logical_monitor = meta_monitor_get_logical_monitor (monitor);
+-
+-  if (meta_backend_is_stage_views_scaled (backend))
+-    return meta_logical_monitor_get_scale (logical_monitor);
+-  else
+-    return 1.0;
++  return get_stream_scale (monitor_src);
+ }
+ 
+ static void
+diff --git a/src/backends/meta-screen-cast-monitor-stream.c b/src/backends/meta-screen-cast-monitor-stream.c
+index 60919db..3a66cca 100644
+--- a/src/backends/meta-screen-cast-monitor-stream.c
++++ b/src/backends/meta-screen-cast-monitor-stream.c
+@@ -193,6 +193,26 @@ meta_screen_cast_monitor_stream_set_parameters (MetaScreenCastStream *stream,
+                          g_variant_new ("s", output_name));
+ }
+ 
++/*
++ * Anland: stream pixels per logical pixel. Shares the monitor at its logical size
++ * (1696x1200 for a 3392x2400 panel at 200%) instead of its physical size: screen
++ * sharing reaches apps as shared memory here (no GPU buffer import on this driver),
++ * so every frame is read back and copied, and a quarter of the pixels keeps the
++ * compositor responsive. MUTTER_SCREEN_CAST_FULL_RESOLUTION=1 restores the physical
++ * size.
++ */
++float
++meta_screen_cast_monitor_stream_get_scale (MetaScreenCastMonitorStream *monitor_stream)
++{
++  MetaBackend *backend = meta_monitor_get_backend (monitor_stream->monitor);
++
++  if (!meta_backend_is_stage_views_scaled (backend))
++    return 1.0;
++  if (g_strcmp0 (g_getenv ("MUTTER_SCREEN_CAST_FULL_RESOLUTION"), "1") == 0)
++    return meta_logical_monitor_get_scale (monitor_stream->logical_monitor);
++  return 1.0;
++}
++
+ static gboolean
+ meta_screen_cast_monitor_stream_transform_position (MetaScreenCastStream *stream,
+                                                     double                stream_x,
+@@ -202,17 +222,13 @@ meta_screen_cast_monitor_stream_transform_position (MetaScreenCastStream *stream
+ {
+   MetaScreenCastMonitorStream *monitor_stream =
+     META_SCREEN_CAST_MONITOR_STREAM (stream);
+-  MetaBackend *backend = meta_monitor_get_backend (monitor_stream->monitor);
+   MtkRectangle logical_monitor_layout;
+   double scale;
+ 
+   logical_monitor_layout =
+     meta_logical_monitor_get_layout (monitor_stream->logical_monitor);
+ 
+-  if (meta_backend_is_stage_views_scaled (backend))
+-    scale = meta_logical_monitor_get_scale (monitor_stream->logical_monitor);
+-  else
+-    scale = 1.0;
++  scale = meta_screen_cast_monitor_stream_get_scale (monitor_stream);
+ 
+   *x = logical_monitor_layout.x + stream_x / scale;
+   *y = logical_monitor_layout.y + stream_y / scale;
+diff --git a/src/backends/meta-screen-cast-monitor-stream.h b/src/backends/meta-screen-cast-monitor-stream.h
+index 6b81ffd..89c6cf0 100644
+--- a/src/backends/meta-screen-cast-monitor-stream.h
++++ b/src/backends/meta-screen-cast-monitor-stream.h
+@@ -43,3 +43,5 @@ MetaScreenCastMonitorStream * meta_screen_cast_monitor_stream_new (MetaScreenCas
+ ClutterStage * meta_screen_cast_monitor_stream_get_stage (MetaScreenCastMonitorStream *monitor_stream);
+ 
+ MetaMonitor * meta_screen_cast_monitor_stream_get_monitor (MetaScreenCastMonitorStream *monitor_stream);
++
++float meta_screen_cast_monitor_stream_get_scale (MetaScreenCastMonitorStream *monitor_stream);
+diff --git a/src/backends/meta-screen-cast-stream-src.c b/src/backends/meta-screen-cast-stream-src.c
+index cf87d4a..6bfe778 100644
+--- a/src/backends/meta-screen-cast-stream-src.c
++++ b/src/backends/meta-screen-cast-stream-src.c
+@@ -67,6 +67,10 @@
+ #define DEFAULT_FRAME_RATE SPA_FRACTION (60, 1)
+ #define MIN_FRAME_RATE SPA_FRACTION (0, 1)
+ #define MAX_FRAME_RATE SPA_FRACTION (1000, 1)
++/* Anland: screen sharing reaches apps as shared memory here (no GPU buffer import on
++ * this driver), so each frame is read back and copied on the compositor's thread;
++ * offering at most 30 fps halves that work against a 60 Hz display. */
++#define ANLAND_MAX_FRAME_RATE 30
+ 
+ #define PARAMS_BUFFER_SIZE 1024
+ 
+@@ -1468,9 +1472,9 @@ add_format_param (MetaScreenCastStreamSrc    *src,
+   struct spa_rectangle min_size = MIN_SIZE;
+   struct spa_rectangle max_size = MAX_SIZE;
+   MetaSpaFractionRange max_framerate_values = {
+-    .def = DEFAULT_FRAME_RATE,
++    .def = SPA_FRACTION (ANLAND_MAX_FRAME_RATE, 1),
+     .min = MIN_FRAME_RATE,
+-    .max = MAX_FRAME_RATE,
++    .max = SPA_FRACTION (ANLAND_MAX_FRAME_RATE, 1),
+   };
+   MetaSpaFractionRange *max_framerate = &max_framerate_values;
+   CoglPixelFormat cogl_format = format->format;
+@@ -1488,7 +1492,9 @@ add_format_param (MetaScreenCastStreamSrc    *src,
+         {
+           MetaFraction frame_rate_fraction;
+ 
+-          frame_rate_fraction = meta_fraction_from_double (spec->frame_rate);
++          frame_rate_fraction =
++            meta_fraction_from_double (MIN (spec->frame_rate,
++                                            (float) ANLAND_MAX_FRAME_RATE));
+           max_framerate_values.min = SPA_FRACTION (1, 1);
+           max_framerate_values.max = SPA_FRACTION (frame_rate_fraction.num,
+                                                    frame_rate_fraction.denom);
